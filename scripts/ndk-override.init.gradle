@@ -1,0 +1,14 @@
+// Usage: ./gradlew --init-script scripts/ndk-override.init.gradle -PndkOverride=<ver>
+// Also pins build-tools via -PbuildToolsOverride. Forces every Android module (some pin an NDK that isn't installed, and the
+// SDK may be read-only) onto the one NDK that is installed.
+def ver = gradle.startParameter.projectProperties['ndkOverride']
+def bt = gradle.startParameter.projectProperties['buildToolsOverride']
+if (ver) {
+    allprojects {
+        afterEvaluate { p ->
+            def ext = p.extensions.findByName('android')
+            if (ext != null && ext.hasProperty('ndkVersion')) ext.ndkVersion = ver
+            if (ext != null && bt != null && ext.hasProperty('buildToolsVersion')) ext.buildToolsVersion = bt
+        }
+    }
+}
