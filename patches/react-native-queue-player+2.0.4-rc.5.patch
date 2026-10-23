@@ -895,6 +895,56 @@ index 6b65300..541765a 100644
      }
  
      override fun onActivated(player: Player, scope: CoroutineScope) {
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlay2Sink.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlay2Sink.kt
+index 3e8ab3b..221bb13 100644
+--- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlay2Sink.kt
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlay2Sink.kt
+@@ -24,6 +24,8 @@ class AirPlay2Sink(private val handle: Long) : AudioSink {
+     companion object {
+         private const val TAG = "AirPlay2Sink"
+         private const val BYTES_PER_SAMPLE_16BIT = 2
++        // The native drain thread's unit: 352 stereo 16-bit frames.
++        private const val CHUNK_BYTES = 352 * 2 * BYTES_PER_SAMPLE_16BIT
+     }
+ 
+     private var sampleRate = 0
+@@ -33,6 +35,8 @@ class AirPlay2Sink(private val handle: Long) : AudioSink {
+ 
+     private var playing = false
+     private var endOfStreamSignaled = false
++    // Whether this end of stream's partial-chunk tail has been padded (see ChunkPadding).
++    private var tailPadded = false
+     private var bufferCallCount = 0L
+     private var startPresentationTimeUs = Long.MIN_VALUE
+     private var bytesSentAtFlush = 0L
+@@ -69,6 +73,7 @@ class AirPlay2Sink(private val handle: Long) : AudioSink {
+         bytesPerFrame = channelCount * BYTES_PER_SAMPLE_16BIT
+         configured = true
+         endOfStreamSignaled = false
++        tailPadded = false
+         Log.i(TAG, "configure: ${sampleRate}Hz, ${channelCount}ch, pcm=${inputFormat.pcmEncoding}")
+     }
+ 
+@@ -83,6 +88,7 @@ class AirPlay2Sink(private val handle: Long) : AudioSink {
+     override fun flush() {
+         Log.i(TAG, "flush()")
+         endOfStreamSignaled = false
++        tailPadded = false
+         startPresentationTimeUs = Long.MIN_VALUE
+         bytesSentAtFlush = AirPlay2JNI.nativeAp2GetBytesSent(handle)
+     }
+@@ -157,6 +163,11 @@ class AirPlay2Sink(private val handle: Long) : AudioSink {
+             Log.i(TAG, "playToEndOfStream: signaled, ringAvail=${AirPlay2JNI.nativeAp2RingAvailable(handle)}")
+         }
+         endOfStreamSignaled = true
++        if (!tailPadded) {
++            val pad = ChunkPadding.bytesToPad(AirPlay2JNI.nativeAp2RingAvailable(handle), CHUNK_BYTES)
++            // A full ring refuses the write; the next playToEndOfStream retries.
++            tailPadded = pad == 0 || AirPlay2JNI.nativeAp2FeedPcm(handle, ByteArray(pad), 0, pad) == pad
++        }
+     }
+ 
+     override fun isEnded(): Boolean {
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayBackend.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayBackend.kt
 index cbabf59..8beb143 100644
 --- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayBackend.kt
@@ -1109,6 +1159,56 @@ index 3d3421c..afaa0a9 100644
      }
  
      override fun onActivated(player: Player, scope: CoroutineScope) {
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlaySink.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlaySink.kt
+index 90b6912..d3edd77 100644
+--- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlaySink.kt
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlaySink.kt
+@@ -33,6 +33,8 @@ class AirPlaySink(private val handle: Long) : AudioSink {
+     companion object {
+         private const val TAG = "AirPlaySink"
+         private const val BYTES_PER_SAMPLE_16BIT = 2
++        // The native drain thread's unit: 352 stereo 16-bit frames.
++        private const val CHUNK_BYTES = 352 * 2 * BYTES_PER_SAMPLE_16BIT
+     }
+ 
+     // -- Configured format --
+@@ -44,6 +46,8 @@ class AirPlaySink(private val handle: Long) : AudioSink {
+     // -- Playback state --
+     private var playing = false
+     private var endOfStreamSignaled = false
++    // Whether this end of stream's partial-chunk tail has been padded (see ChunkPadding).
++    private var tailPadded = false
+     private var bufferCallCount = 0L
+     private var startPresentationTimeUs = Long.MIN_VALUE
+     private var bytesSentAtFlush = 0L
+@@ -92,6 +96,7 @@ class AirPlaySink(private val handle: Long) : AudioSink {
+         bytesPerFrame = channelCount * BYTES_PER_SAMPLE_16BIT
+         configured = true
+         endOfStreamSignaled = false
++        tailPadded = false
+         Log.i(TAG, "configure: ${sampleRate}Hz, ${channelCount}ch, pcm=${inputFormat.pcmEncoding}")
+     }
+ 
+@@ -116,6 +121,7 @@ class AirPlaySink(private val handle: Long) : AudioSink {
+         // state. Flushing libraop while the drain thread is running would
+         // cause state corruption. The ring buffer handles back-pressure.
+         endOfStreamSignaled = false
++        tailPadded = false
+         startPresentationTimeUs = Long.MIN_VALUE
+         bytesSentAtFlush = AirplayJNI.nativeBytesSent(handle)
+     }
+@@ -200,6 +206,11 @@ class AirPlaySink(private val handle: Long) : AudioSink {
+             Log.i(TAG, "playToEndOfStream: signaled, ringAvail=${AirplayJNI.nativeRingAvailable(handle)}")
+         }
+         endOfStreamSignaled = true
++        if (!tailPadded) {
++            val pad = ChunkPadding.bytesToPad(AirplayJNI.nativeRingAvailable(handle), CHUNK_BYTES)
++            // A full ring refuses the write; the next playToEndOfStream retries.
++            tailPadded = pad == 0 || AirplayJNI.nativeFeedPcm(handle, ByteArray(pad), 0, pad) == pad
++        }
+     }
+ 
+     override fun isEnded(): Boolean {
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayTxtParser.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayTxtParser.kt
 index cbfee86..1d20fb5 100644
 --- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayTxtParser.kt
@@ -1197,6 +1297,25 @@ index 0000000..fad2ca0
 +      return if (v == 0f) -144f else -30f + v * 30f
 +    }
 +  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/ChunkPadding.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/ChunkPadding.kt
+new file mode 100644
+index 0000000..70ded21
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/ChunkPadding.kt
+@@ -0,0 +1,13 @@
++package com.margelo.nitro.queueplayer.cast.airplay
++
++/**
++ * The native AirPlay drain threads send whole chunks only (352 frames), so the
++ * tail of a track that is not a whole number of chunks would sit in the ring
++ * forever: the sink never ends and Media3 fails the item as stuck. At end of
++ * stream the sinks pad that tail with silence (under one chunk, ~8 ms).
++ */
++internal object ChunkPadding {
++  /** Silence bytes that round [pendingBytes] up to a whole number of chunks. */
++  fun bytesToPad(pendingBytes: Int, chunkBytes: Int): Int =
++    (chunkBytes - pendingBytes % chunkBytes) % chunkBytes
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/chromecast/MediaInfoBuilder.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/chromecast/MediaInfoBuilder.kt
 index 80a3bdd..3be1333 100644
@@ -2137,6 +2256,44 @@ index 0000000..0fbb71b
 +  @Test
 +  fun `et is read from the TXT record`() {
 +    assertEquals("0,4", AirPlayTxtParser.parse(mapOf("et" to "0,4")).encryptionTypes)
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/ChunkPaddingTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/ChunkPaddingTest.kt
+new file mode 100644
+index 0000000..f80b3e9
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/ChunkPaddingTest.kt
+@@ -0,0 +1,32 @@
++package com.margelo.nitro.queueplayer.cast.airplay
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++/**
++ * The AirPlay drain threads send whole 352-frame chunks only, so a track
++ * whose length is not a multiple of a chunk leaves a tail that never drains:
++ * the sink never ends and Media3 fails the item as stuck. The tail is padded
++ * with silence up to a whole chunk at end of stream.
++ */
++class ChunkPaddingTest {
++
++  private val chunk = 352 * 4
++
++  @Test
++  fun `pads the leftover tail up to a whole chunk`() {
++    // Observed on device: 179840 bytes queued at end of stream = 127 chunks + 1024.
++    assertEquals(chunk - 1024, ChunkPadding.bytesToPad(179_840, chunk))
++  }
++
++  @Test
++  fun `needs nothing when the queue is already whole chunks`() {
++    assertEquals(0, ChunkPadding.bytesToPad(0, chunk))
++    assertEquals(0, ChunkPadding.bytesToPad(chunk * 3, chunk))
++  }
++
++  @Test
++  fun `a short tail is padded to one chunk`() {
++    assertEquals(chunk - 4, ChunkPadding.bytesToPad(4, chunk))
 +  }
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastChannelTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastChannelTest.kt
