@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Cast, useCast } from 'react-native-queue-player';
+import { castReceiversStore } from '../../store/castReceiversStore';
 import type { DiscoveryState, RouteInfo } from './types';
 
 export interface UseRouteDiscoveryResult {
@@ -26,6 +27,7 @@ export interface UseRouteDiscoveryResult {
  */
 export function useRouteDiscovery(): UseRouteDiscoveryResult {
   const snapshot = useCast();
+  const savedReceivers = castReceiversStore((s) => s.receivers);
   /** Raise the system prompt. Safe to call again — iOS shows it once, and a repeat
    *  call just re-reads the answer. */
   const requestPermission = useCallback(async () => {
@@ -89,8 +91,23 @@ export function useRouteDiscovery(): UseRouteDiscoveryResult {
       lastError: errorById[r.id],
     }));
 
-    return [localRoute, ...remote];
-  }, [snapshot.receivers, snapshot.route, connectingIds, errorById]);
+    // Self-hosted Cast receivers added in Settings: not discoverable through the
+    // Cast SDK, connected by certificate fingerprint instead.
+    const saved: RouteInfo[] = savedReceivers.map((r) => ({
+      id: r.id,
+      protocol: 'chromecast',
+      protocolVersion: '',
+      name: r.name,
+      modelName: '',
+      iconHint: 'speaker',
+      capabilities: { supportsRemoteVolume: true, streamingModel: 'pullUrl', requiresPairing: false },
+      isActive: snapshot.route.receiverId === r.id,
+      isConnecting: connectingIds.has(r.id),
+      lastError: errorById[r.id],
+    }));
+
+    return [localRoute, ...remote, ...saved];
+  }, [snapshot.receivers, snapshot.route, savedReceivers, connectingIds, errorById]);
 
   const connect = useCallback(
     async (receiverId: string, password?: string) => {
@@ -100,7 +117,9 @@ export function useRouteDiscovery(): UseRouteDiscoveryResult {
         return rest;
       });
       try {
-        await Cast.connect(receiverId, password ? { password } : undefined);
+        const pin = castReceiversStore.getState().receivers.find((r) => r.id === receiverId)?.fingerprint;
+        const secret = password ?? pin;
+        await Cast.connect(receiverId, secret ? { password: secret } : undefined);
       } catch (err) {
         const code =
           (err as { code?: string; name?: string })?.code ??

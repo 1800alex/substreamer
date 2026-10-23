@@ -644,18 +644,128 @@ index 81f8a83..4212a0c 100644
      if (!r || !jImageData) return JNI_FALSE;
  
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt
-index 9d6e216..9f189d6 100644
+index 9d6e216..6c0dfc0 100644
 --- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt
 +++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt
-@@ -18,6 +18,7 @@ import com.margelo.nitro.queueplayer.cast.CastSinkRouter
+@@ -18,6 +18,10 @@ import com.margelo.nitro.queueplayer.cast.CastSinkRouter
  import com.margelo.nitro.queueplayer.cast.PlaybackStateRouter
  import com.margelo.nitro.queueplayer.cast.chromecast.ChromecastSession as RoutedChromecastSession
  import com.margelo.nitro.queueplayer.cast.CastSession as RoutedCastSession
 +import com.margelo.nitro.queueplayer.cast.airplay.AirPlayVolumeControl
++import com.margelo.nitro.queueplayer.cast.direct.DirectCastSession
++import com.margelo.nitro.queueplayer.cast.direct.DirectCastTarget
++import com.margelo.nitro.queueplayer.cast.direct.openDirectCastSession
  import com.margelo.nitro.queueplayer.cast.airplay.AirPlay2JNI
  import com.margelo.nitro.queueplayer.cast.airplay.AirPlayBackend
  import com.margelo.nitro.queueplayer.cast.airplay.AirPlayReceiverMapper
-@@ -493,7 +494,7 @@ class CastManager : HybridCastManagerSpec() {
+@@ -107,6 +111,8 @@ class CastManager : HybridCastManagerSpec() {
+   // drain thread without a happens-before edge to the connect-thread
+   // assignment.
+   private val activeAirplaySession = AtomicReference<RoutedCastSession?>(null)
++  // Self-hosted Cast receiver (certificate-pinned, no Cast SDK), if active.
++  private val activeDirectSession = AtomicReference<DirectCastSession?>(null)
+ 
+   /**
+    * Active Chromecast remote-player session, set by
+@@ -189,6 +195,7 @@ class CastManager : HybridCastManagerSpec() {
+       publishReceivers()
+     }
+     backend.onSessionConnected = { session, deviceId ->
++      teardownDirectSession()
+       // Mint the remote-player session + register with
+       // PlaybackStateRouter so the transport-side shim sees the live
+       // remote. The app context lets the session build its receiver-only
+@@ -325,6 +332,7 @@ class CastManager : HybridCastManagerSpec() {
+ 
+   private fun installAirplaySession(session: RoutedCastSession, receiverId: String) {
+     closeAirplaySession()
++    teardownDirectSession()
+     activeAirplaySession.set(session)
+     session.deathListener = { reason ->
+       onAirplaySessionDied(receiverId, reason)
+@@ -345,6 +353,46 @@ class CastManager : HybridCastManagerSpec() {
+     }
+   }
+ 
++  /** Route playback to a connected self-hosted Cast receiver. Main thread. */
++  private fun installDirectSession(session: DirectCastSession, receiverId: String, target: DirectCastTarget) {
++    teardownDirectSession()
++    activeDirectSession.set(session)
++    PlaybackStateRouter.setActive(session)
++    session.deathListener = { reason ->
++      mainHandler.post {
++        if (activeDirectSession.get() !== session) return@post
++        teardownDirectSession()
++        currentRoute = localFallbackRoute()
++        val r = currentRoute
++        val event = CastSessionDiedEvent(receiverId = receiverId, reason = CastSessionEndReason.NETWORKLOSS)
++        for (l in routeListeners.values) l(r)
++        for (l in sessionDiedListeners.values) l(event)
++      }
++    }
++    currentRoute = CastRoute(
++      castProtocol = CastProtocol.CHROMECAST,
++      receiverId = receiverId,
++      name = target.name,
++      iconHint = CastDeviceKind.SPEAKER,
++      capabilities = CastReceiverCapabilities(
++        supportsRemoteVolume = true,
++        streamingModel = CastStreamingModel.PULLURL,
++        requiresPairing = false,
++      ),
++      protocolVersion = "",
++    )
++    val r = currentRoute
++    for (l in routeListeners.values) l(r)
++  }
++
++  private fun teardownDirectSession() {
++    val session = activeDirectSession.getAndSet(null) ?: return
++    session.deathListener = null
++    PlaybackStateRouter.clearActive(session)
++    runCatching { session.close() }
++      .onFailure { android.util.Log.w("CastManager", "Error closing self-hosted Cast session: $it") }
++  }
++
+   private fun closeAirplaySession() {
+     val session = activeAirplaySession.getAndSet(null) ?: return
+     session.deathListener = null
+@@ -444,6 +492,26 @@ class CastManager : HybridCastManagerSpec() {
+         )
+         withChromecastBackend { it.connect(receiverId) }
+       }
++      receiverId.startsWith(DirectCastTarget.PREFIX) -> {
++        val target = DirectCastTarget.parse(receiverId)
++        if (target == null) {
++          promise.reject(IllegalArgumentException("Bad self-hosted Cast receiver id"))
++        } else {
++          airplayScope.launch {
++            try {
++              val session = openDirectCastSession(context, target, options.password)
++              mainHandler.post {
++                closeAirplaySession()
++                if (activeChromecastSession.get() != null) withChromecastBackend { it.disconnect() }
++                installDirectSession(session, receiverId, target)
++                promise.resolve(Unit)
++              }
++            } catch (t: Throwable) {
++              promise.reject(t)
++            }
++          }
++        }
++      }
+       receiverId.startsWith("airplay:") -> {
+         val backend = airplayBackend()
+         if (backend == null) {
+@@ -470,6 +538,7 @@ class CastManager : HybridCastManagerSpec() {
+ 
+   override fun disconnect(): Promise<Unit> {
+     closeAirplaySession()
++    teardownDirectSession()
+     withChromecastBackend { it.disconnect() }
+     if (currentRoute.castProtocol != CastProtocol.LOCAL) {
+       currentRoute = localFallbackRoute()
+@@ -493,7 +562,7 @@ class CastManager : HybridCastManagerSpec() {
     * is active or none has been reported yet. For Chromecast this is the device
     * volume (`CastSession.volume`) observed via the session's `Cast.Listener` —
     * the same plane `setRouteVolume` writes. AirPlay receivers don't report
@@ -664,14 +774,25 @@ index 9d6e216..9f189d6 100644
     */
    override fun getRouteVolume(): Double {
      val cc = activeChromecastSession.get()
-@@ -501,6 +502,7 @@ class CastManager : HybridCastManagerSpec() {
+@@ -501,6 +570,8 @@ class CastManager : HybridCastManagerSpec() {
        val v = cc.volume.value
        if (!v.isNaN()) return v.toDouble()
      }
 +    (activeAirplaySession.get() as? AirPlayVolumeControl)?.let { return it.linearVolume.toDouble() }
++    activeDirectSession.get()?.volume?.takeIf { !it.isNaN() }?.let { return it.toDouble() }
      return Double.NaN
    }
  
+@@ -510,7 +581,8 @@ class CastManager : HybridCastManagerSpec() {
+     }
+     val clamped = value.coerceIn(0.0, 1.0)
+     when (currentRoute.castProtocol) {
+-      CastProtocol.CHROMECAST -> withChromecastBackend { it.setVolume(clamped) }
++      CastProtocol.CHROMECAST -> activeDirectSession.get()?.setVolume(clamped.toFloat())
++        ?: withChromecastBackend { it.setVolume(clamped) }
+       CastProtocol.AIRPLAY -> activeAirplaySession.get()?.setVolume(clamped.toFloat())
+       else -> { /* no-op for local */ }
+     }
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/PlaybackService.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/PlaybackService.kt
 index 52304d2..9bbf851 100644
 --- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/PlaybackService.kt
@@ -1077,6 +1198,902 @@ index 0000000..fad2ca0
 +    }
 +  }
 +}
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/chromecast/MediaInfoBuilder.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/chromecast/MediaInfoBuilder.kt
+index 80a3bdd..3be1333 100644
+--- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/chromecast/MediaInfoBuilder.kt
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/chromecast/MediaInfoBuilder.kt
+@@ -76,7 +76,7 @@ internal object MediaInfoBuilder {
+       .build()
+   }
+ 
+-  private fun guessContentType(url: String): String {
++  internal fun guessContentType(url: String): String {
+     val path = url.substringBefore('?').substringBefore('#')
+     val ext = path.substringAfterLast('.', "").lowercase()
+     return when (ext) {
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastChannel.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastChannel.kt
+new file mode 100644
+index 0000000..d90b2e3
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastChannel.kt
+@@ -0,0 +1,189 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import android.util.Log
++import org.json.JSONObject
++import java.io.DataInputStream
++import java.io.IOException
++import java.net.InetAddress
++import java.net.InetSocketAddress
++import java.security.cert.X509Certificate
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.Executors
++import java.util.concurrent.LinkedBlockingQueue
++import java.util.concurrent.ScheduledExecutorService
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicInteger
++import javax.net.ssl.SSLContext
++import javax.net.ssl.SSLSocket
++import javax.net.ssl.X509TrustManager
++
++internal class CastPinMismatchException(message: String) : IOException(message)
++
++/**
++ * Cast v2 connection to a self-hosted receiver, authenticated by certificate
++ * pin. The TLS layer accepts any certificate only so it can be read; the pin is
++ * checked right after the handshake and before anything is sent.
++ */
++internal class CastChannel private constructor(
++  private val socket: SSLSocket,
++  private val timeoutMs: Long,
++) : AutoCloseable {
++
++  /** Messages that are not replies to a request: status broadcasts, CLOSE. */
++  @Volatile var onUnsolicited: ((namespace: String, payload: JSONObject) -> Unit)? = null
++  /** Called once when the connection drops (not after [close]). */
++  @Volatile var onClosed: (() -> Unit)? = null
++
++  val localAddress: InetAddress get() = socket.localAddress
++  val remoteAddress: InetAddress get() = socket.inetAddress
++
++  private val output = socket.getOutputStream()
++  private val nextId = AtomicInteger(1)
++  private val waiters = ConcurrentHashMap<Int, LinkedBlockingQueue<JSONObject>>()
++  private val connected = ConcurrentHashMap.newKeySet<String>()
++  @Volatile private var closed = false
++  private val heartbeat: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
++    Thread(r, "cast-heartbeat").apply { isDaemon = true }
++  }
++
++  init {
++    Thread({ readLoop() }, "cast-reader").apply { isDaemon = true }.start()
++    connect(PLATFORM)
++    heartbeat.scheduleWithFixedDelay({
++      runCatching { send(PLATFORM, NS_HEARTBEAT, JSONObject().put("type", "PING")) }
++    }, HEARTBEAT_S, HEARTBEAT_S, TimeUnit.SECONDS)
++  }
++
++  fun send(destination: String, namespace: String, payload: JSONObject) {
++    val bytes = CastMessageCodec.encode(CastMessage(SENDER, destination, namespace, payload.toString()))
++    synchronized(output) {
++      output.write(bytes)
++      output.flush()
++    }
++  }
++
++  /** Send with a fresh `requestId` and wait for the reply carrying it. */
++  fun request(destination: String, namespace: String, payload: JSONObject): JSONObject {
++    if (closed) throw IOException("Cast connection closed")
++    val id = nextId.getAndIncrement()
++    val queue = LinkedBlockingQueue<JSONObject>(1)
++    waiters[id] = queue
++    try {
++      send(destination, namespace, payload.put("requestId", id))
++      return queue.poll(timeoutMs, TimeUnit.MILLISECONDS)
++        ?.takeUnless { it.has(CLOSED_MARKER) }
++        ?: throw IOException("No reply to ${payload.optString("type")} (closed=$closed)")
++    } finally {
++      waiters.remove(id)
++    }
++  }
++
++  /** Launch the Default Media Receiver and connect to it; returns its transport id. */
++  fun launchMediaApp(): String {
++    val status = request(PLATFORM, NS_RECEIVER, JSONObject().put("type", "LAUNCH").put("appId", MEDIA_APP))
++    if (status.optString("type") != "RECEIVER_STATUS") {
++      throw IOException("Receiver refused the media app: ${status.optString("reason", status.optString("type"))}")
++    }
++    val apps = status.optJSONObject("status")?.optJSONArray("applications")
++    val transport = (0 until (apps?.length() ?: 0)).map { apps!!.getJSONObject(it) }
++      .firstOrNull { it.optString("appId") == MEDIA_APP }?.optString("transportId")
++      ?.takeIf { it.isNotEmpty() }
++      ?: throw IOException("Receiver did not report the media app")
++    connect(transport)
++    return transport
++  }
++
++  fun setVolume(level: Double) {
++    request(PLATFORM, NS_RECEIVER, JSONObject().put("type", "SET_VOLUME")
++      .put("volume", JSONObject().put("level", level.coerceIn(0.0, 1.0)).put("muted", level <= 0.0)))
++  }
++
++  private fun connect(destination: String) {
++    if (connected.add(destination)) send(destination, NS_CONNECTION, JSONObject().put("type", "CONNECT"))
++  }
++
++  private fun readLoop() {
++    val input = DataInputStream(socket.getInputStream())
++    try {
++      while (!closed) {
++        val len = input.readInt()
++        if (len <= 0 || len > CastMessageCodec.MAX_MESSAGE) throw IOException("Bad Cast frame length $len")
++        val body = ByteArray(len).also { input.readFully(it) }
++        val msg = CastMessageCodec.decode(body) ?: continue
++        val payload = runCatching { JSONObject(msg.payload) }.getOrNull() ?: continue
++        when {
++          msg.namespace == NS_HEARTBEAT && payload.optString("type") == "PING" ->
++            send(msg.source, NS_HEARTBEAT, JSONObject().put("type", "PONG"))
++          msg.namespace == NS_HEARTBEAT -> Unit
++          else -> {
++            val waiter = payload.optInt("requestId").takeIf { it > 0 }?.let { waiters[it] }
++            if (waiter != null) waiter.offer(payload) else onUnsolicited?.invoke(msg.namespace, payload)
++          }
++        }
++      }
++    } catch (t: Throwable) {
++      if (!closed) Log.i(TAG, "Cast connection ended: $t")
++    }
++    if (!closed) {
++      shutdown()
++      onClosed?.invoke()
++    }
++  }
++
++  private fun shutdown() {
++    closed = true
++    heartbeat.shutdownNow()
++    waiters.values.forEach { it.offer(JSONObject().put(CLOSED_MARKER, true)) }
++    runCatching { socket.close() }
++  }
++
++  override fun close() {
++    if (closed) return
++    runCatching {
++      connected.filter { it != PLATFORM }.forEach { send(it, NS_CONNECTION, JSONObject().put("type", "CLOSE")) }
++    }
++    shutdown()
++  }
++
++  companion object {
++    const val TAG = "CastChannel"
++    const val SENDER = "sender-0"
++    const val PLATFORM = "receiver-0"
++    const val MEDIA_APP = "CC1AD845"
++    const val NS_CONNECTION = "urn:x-cast:com.google.cast.tp.connection"
++    const val NS_HEARTBEAT = "urn:x-cast:com.google.cast.tp.heartbeat"
++    const val NS_RECEIVER = "urn:x-cast:com.google.cast.receiver"
++    const val NS_MEDIA = "urn:x-cast:com.google.cast.media"
++    private const val HEARTBEAT_S = 5L
++    private const val CLOSED_MARKER = "__closed"
++
++    /** Accepts any certificate so it can be read; [open] enforces the pin. */
++    private val readAnyCertificate = object : X509TrustManager {
++      override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
++      override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
++      override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
++    }
++
++    fun open(host: String, port: Int, pin: String, timeoutMs: Long = 5_000): CastChannel {
++      val ctx = SSLContext.getInstance("TLS").apply { init(null, arrayOf(readAnyCertificate), null) }
++      val socket = ctx.socketFactory.createSocket() as SSLSocket
++      try {
++        socket.connect(InetSocketAddress(host, port), timeoutMs.toInt())
++        socket.soTimeout = timeoutMs.toInt()
++        socket.startHandshake()
++        val der = socket.session.peerCertificates.firstOrNull()?.encoded
++          ?: throw CastPinMismatchException("Receiver sent no certificate")
++        if (!CastPin.matches(der, pin)) {
++          throw CastPinMismatchException(
++            "Receiver certificate SHA-256 ${CastPin.fingerprint(der)} does not match the saved fingerprint",
++          )
++        }
++        socket.soTimeout = 0
++        return CastChannel(socket, timeoutMs)
++      } catch (t: Throwable) {
++        runCatching { socket.close() }
++        throw t
++      }
++    }
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastMessageCodec.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastMessageCodec.kt
+new file mode 100644
+index 0000000..49fe235
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastMessageCodec.kt
+@@ -0,0 +1,94 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import java.io.ByteArrayOutputStream
++import java.nio.ByteBuffer
++
++/** A Cast v2 `CastMessage` with a UTF-8 string payload (all the media protocol uses). */
++internal data class CastMessage(
++  val source: String,
++  val destination: String,
++  val namespace: String,
++  val payload: String,
++)
++
++/**
++ * Cast v2 wire format: a 4-byte big-endian length, then the protobuf
++ * `CastMessage` (1 protocol_version, 2 source_id, 3 destination_id,
++ * 4 namespace, 5 payload_type, 6 payload_utf8). Hand-encoded; binary
++ * payloads (device auth) are not supported.
++ */
++internal object CastMessageCodec {
++
++  const val MAX_MESSAGE = 64 * 1024
++
++  fun encode(message: CastMessage): ByteArray {
++    val body = ByteArrayOutputStream()
++    body.write(byteArrayOf(0x08, 0x00))
++    writeString(body, 2, message.source)
++    writeString(body, 3, message.destination)
++    writeString(body, 4, message.namespace)
++    body.write(byteArrayOf(0x28, 0x00))
++    writeString(body, 6, message.payload)
++    val bytes = body.toByteArray()
++    return ByteBuffer.allocate(4 + bytes.size).putInt(bytes.size).put(bytes).array()
++  }
++
++  /** Decode a message body (without its length prefix); null when malformed. */
++  fun decode(body: ByteArray): CastMessage? {
++    var pos = 0
++    val strings = HashMap<Int, String>()
++    var payloadType = 0L
++    fun varint(): Long? {
++      var value = 0L
++      var shift = 0
++      while (shift < 64) {
++        if (pos >= body.size) return null
++        val b = body[pos++].toInt() and 0xff
++        value = value or ((b and 0x7f).toLong() shl shift)
++        if (b < 0x80) return value
++        shift += 7
++      }
++      return null
++    }
++    while (pos < body.size) {
++      val tag = varint() ?: return null
++      val field = (tag ushr 3).toInt()
++      when ((tag and 7).toInt()) {
++        0 -> {
++          val v = varint() ?: return null
++          if (field == 5) payloadType = v
++        }
++        2 -> {
++          val len = varint() ?: return null
++          if (len < 0 || pos + len > body.size) return null
++          strings[field] = String(body, pos, len.toInt(), Charsets.UTF_8)
++          pos += len.toInt()
++        }
++        else -> return null
++      }
++    }
++    if (payloadType != 0L) return null
++    return CastMessage(
++      source = strings[2] ?: return null,
++      destination = strings[3] ?: return null,
++      namespace = strings[4] ?: return null,
++      payload = strings[6] ?: return null,
++    )
++  }
++
++  private fun writeString(out: ByteArrayOutputStream, field: Int, value: String) {
++    val bytes = value.toByteArray(Charsets.UTF_8)
++    writeVarint(out, (field shl 3 or 2).toLong())
++    writeVarint(out, bytes.size.toLong())
++    out.write(bytes)
++  }
++
++  private fun writeVarint(out: ByteArrayOutputStream, value: Long) {
++    var v = value
++    while (v >= 0x80) {
++      out.write(((v and 0x7f) or 0x80).toInt())
++      v = v ushr 7
++    }
++    out.write(v.toInt())
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastPin.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastPin.kt
+new file mode 100644
+index 0000000..0cdc770
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastPin.kt
+@@ -0,0 +1,26 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import java.security.MessageDigest
++
++/**
++ * Certificate pin for a self-hosted Cast receiver: the SHA-256 of its TLS
++ * certificate (DER), as 64 hex characters. Such receivers have no Google
++ * device certificate, so the pin is what proves the connection reached the
++ * receiver the user configured.
++ */
++internal object CastPin {
++
++  private val HEX64 = Regex("^[0-9a-f]{64}$")
++
++  /** Lowercase hex without separators, or null unless it is a full SHA-256. */
++  fun normalize(raw: String): String? =
++    raw.lowercase().filterNot { it == ':' || it.isWhitespace() }.takeIf { HEX64.matches(it) }
++
++  fun fingerprint(der: ByteArray): String =
++    MessageDigest.getInstance("SHA-256").digest(der).joinToString("") { "%02x".format(it) }
++
++  fun matches(der: ByteArray, pin: String): Boolean {
++    val expected = normalize(pin) ?: return false
++    return MessageDigest.isEqual(fingerprint(der).toByteArray(), expected.toByteArray())
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCast.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCast.kt
+new file mode 100644
+index 0000000..c5aa15b
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCast.kt
+@@ -0,0 +1,57 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import android.content.Context
++import android.net.wifi.WifiManager
++import android.os.PowerManager
++import java.net.URLDecoder
++
++/**
++ * A manually configured self-hosted Cast receiver, addressed by receiver id
++ * `castdirect:<host>:<port>[:<url-encoded name>]`. The certificate pin travels
++ * separately as the connect password.
++ */
++internal data class DirectCastTarget(val host: String, val port: Int, val name: String) {
++  companion object {
++    const val PREFIX = "castdirect:"
++
++    fun parse(receiverId: String): DirectCastTarget? {
++      if (!receiverId.startsWith(PREFIX)) return null
++      val parts = receiverId.removePrefix(PREFIX).split(':', limit = 3)
++      val host = parts.getOrNull(0)?.takeIf { it.isNotEmpty() } ?: return null
++      val port = parts.getOrNull(1)?.toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
++      val name = parts.getOrNull(2)?.let { runCatching { URLDecoder.decode(it, "UTF-8") }.getOrNull() }
++        ?.takeIf { it.isNotBlank() } ?: host
++      return DirectCastTarget(host, port, name)
++    }
++  }
++}
++
++/** Keeps the CPU and Wi-Fi up while the phone serves audio to a receiver. */
++internal class CastKeepAwake(context: Context) : AutoCloseable {
++  private val wake = (context.getSystemService(Context.POWER_SERVICE) as PowerManager)
++    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "QueuePlayer:DirectCast")
++    .apply { setReferenceCounted(false); acquire() }
++
++  @Suppress("DEPRECATION") // HIGH_PERF is the mode that keeps Wi-Fi awake on every API level.
++  private val wifi = (context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
++    .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "QueuePlayer:DirectCast")
++    .apply { setReferenceCounted(false); acquire() }
++
++  override fun close() {
++    runCatching { if (wake.isHeld) wake.release() }
++    runCatching { if (wifi.isHeld) wifi.release() }
++  }
++}
++
++/** Connect to [target] with certificate [pin] and start a media session (blocking). */
++internal fun openDirectCastSession(context: Context, target: DirectCastTarget, pin: String): DirectCastSession {
++  val channel = CastChannel.open(target.host, target.port, pin)
++  try {
++    val transport = channel.launchMediaApp()
++    val leases = MediaLeaseServer(channel.localAddress)
++    return DirectCastSession(channel, transport, leases, keepAwake = CastKeepAwake(context))
++  } catch (t: Throwable) {
++    channel.close()
++    throw t
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSession.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSession.kt
+new file mode 100644
+index 0000000..66cb0c5
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSession.kt
+@@ -0,0 +1,290 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import android.util.Log
++import com.margelo.nitro.queueplayer.cast.CastMediaItem
++import com.margelo.nitro.queueplayer.cast.CastSession
++import com.margelo.nitro.queueplayer.cast.RemoteEndReason
++import com.margelo.nitro.queueplayer.cast.RemoteMediaError
++import com.margelo.nitro.queueplayer.cast.RemotePlaybackState
++import com.margelo.nitro.queueplayer.cast.RemoteRepeatMode
++import com.margelo.nitro.queueplayer.cast.chromecast.MediaInfoBuilder
++import kotlinx.coroutines.flow.MutableSharedFlow
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.SharedFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asSharedFlow
++import kotlinx.coroutines.flow.asStateFlow
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++
++/**
++ * Playback on a self-hosted Cast receiver through the Default Media Receiver.
++ * Such receivers take one item at a time (no QUEUE_* messages), so the queue
++ * lives here: each track is LOADed through a [MediaLeaseServer] lease, status
++ * is polled, and the next track is loaded when the receiver reports FINISHED.
++ */
++internal class DirectCastSession(
++  private val channel: CastChannel,
++  private val transport: String,
++  private val leases: MediaLeaseServer,
++  pollMs: Long = 1_000,
++  private val keepAwake: AutoCloseable? = null,
++) : CastSession.RemotePlayer() {
++
++  private val _state = MutableStateFlow(RemotePlaybackState.IDLE)
++  private val _positionMs = MutableStateFlow(0L)
++  private val _durationMs = MutableStateFlow(0L)
++  private val _currentTrackIndex = MutableStateFlow(-1)
++  private val _endedReason = MutableSharedFlow<RemoteEndReason>(extraBufferCapacity = 4)
++  private val _mediaError = MutableSharedFlow<RemoteMediaError>(extraBufferCapacity = 4)
++  private val _seekCompleted = MutableSharedFlow<Long>(extraBufferCapacity = 4)
++
++  override val state: StateFlow<RemotePlaybackState> = _state.asStateFlow()
++  @Volatile override var hasReportedState: Boolean = false
++  override val positionMs: StateFlow<Long> = _positionMs.asStateFlow()
++  override val durationMs: StateFlow<Long> = _durationMs.asStateFlow()
++  override val currentTrackIndex: StateFlow<Int> = _currentTrackIndex.asStateFlow()
++  override val endedReason: SharedFlow<RemoteEndReason> = _endedReason.asSharedFlow()
++  override val mediaError: SharedFlow<RemoteMediaError> = _mediaError.asSharedFlow()
++  override val seekCompleted: SharedFlow<Long> = _seekCompleted.asSharedFlow()
++
++  /** Last receiver volume `0.0..1.0` (sent or reported); NaN until known. */
++  @Volatile var volume: Float = Float.NaN
++    private set
++
++  // Queue state, confined to [worker].
++  private var queue: MutableList<CastMediaItem> = mutableListOf()
++  private var index = -1
++  private var repeat = RemoteRepeatMode.OFF
++  private var mediaSessionId: Int? = null
++  private var loadedUrl: String? = null
++  private var finishHandled = false
++
++  @Volatile private var closed = false
++  private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "cast-direct").apply { isDaemon = true } }
++  private val poller = Executors.newSingleThreadScheduledExecutor { r ->
++    Thread(r, "cast-direct-poll").apply { isDaemon = true }
++  }
++
++  init {
++    channel.onUnsolicited = { ns, payload ->
++      when {
++        ns == CastChannel.NS_MEDIA && payload.optString("type") == "MEDIA_STATUS" ->
++          onWorker { applyStatus(payload) }
++        ns == CastChannel.NS_RECEIVER && payload.optString("type") == "RECEIVER_STATUS" ->
++          payload.optJSONObject("status")?.optJSONObject("volume")?.let { volume = it.optDouble("level").toFloat() }
++        ns == CastChannel.NS_CONNECTION && payload.optString("type") == "CLOSE" -> receiverGone("closed")
++      }
++    }
++    channel.onClosed = { receiverGone("network") }
++    poller.scheduleWithFixedDelay({
++      onWorker { if (mediaSessionId != null) mediaRequest(JSONObject().put("type", "GET_STATUS")) }
++    }, pollMs, pollMs, TimeUnit.MILLISECONDS)
++  }
++
++  // ---- RemotePlayer ----
++
++  override suspend fun load(items: List<CastMediaItem>, startIndex: Int, startPositionMs: Long, playWhenReady: Boolean) {
++    onWorker {
++      queue = items.toMutableList()
++      loadIndex(startIndex.coerceIn(0, (queue.size - 1).coerceAtLeast(0)), startPositionMs, playWhenReady)
++    }
++  }
++
++  override fun play() = command("PLAY")
++  override fun pause() = command("PAUSE")
++  override fun stop() = command("STOP")
++
++  override fun seekTo(positionMs: Long) = onWorker {
++    val id = mediaSessionId ?: return@onWorker
++    // Keep the play/pause state: receivers resume after a seek without resumeState.
++    val resume = if (_state.value == RemotePlaybackState.PAUSED) "PLAYBACK_PAUSE" else "PLAYBACK_START"
++    mediaRequest(JSONObject().put("type", "SEEK").put("mediaSessionId", id)
++      .put("currentTime", positionMs / 1000.0).put("resumeState", resume))
++      ?.let { _seekCompleted.tryEmit(positionMs) }
++  }
++
++  override fun queueNext() = onWorker { if (index + 1 < queue.size) loadIndex(index + 1, 0, true) }
++  override fun queuePrev() = onWorker { if (index > 0) loadIndex(index - 1, 0, true) }
++  override fun skipToQueueIndex(index: Int) = onWorker { if (index in queue.indices) loadIndex(index, 0, true) }
++
++  override suspend fun queueInsert(items: List<CastMediaItem>, beforeIndex: Int?) = onWorker {
++    val at = beforeIndex?.coerceIn(0, queue.size) ?: queue.size
++    queue.addAll(at, items)
++    if (index >= 0 && at <= index) setIndex(index + items.size)
++  }
++
++  override suspend fun queueRemove(indices: List<Int>) = onWorker {
++    val removingCurrent = index in indices
++    var newIndex = index
++    indices.filter { it in queue.indices }.sortedDescending().forEach { i ->
++      queue.removeAt(i)
++      if (i < index) newIndex--
++    }
++    when {
++      queue.isEmpty() -> clearPlayback()
++      removingCurrent -> loadIndex(newIndex.coerceIn(0, queue.size - 1), 0, _state.value == RemotePlaybackState.PLAYING)
++      else -> setIndex(newIndex)
++    }
++  }
++
++  override suspend fun queueMove(fromIndex: Int, toIndex: Int) = onWorker {
++    if (fromIndex !in queue.indices || toIndex !in queue.indices || fromIndex == toIndex) return@onWorker
++    queue.add(toIndex, queue.removeAt(fromIndex))
++    setIndex(when {
++      index == fromIndex -> toIndex
++      fromIndex < index && toIndex >= index -> index - 1
++      fromIndex > index && toIndex <= index -> index + 1
++      else -> index
++    })
++  }
++
++  override suspend fun queueClear() = onWorker {
++    queue.clear()
++    clearPlayback()
++  }
++
++  /** Receivers following the Default Media Receiver API play at 1x only. */
++  override fun setPlaybackRate(rate: Float) = Unit
++
++  override fun setRepeatMode(mode: RemoteRepeatMode) = onWorker { repeat = mode }
++
++  override fun setVolume(value: Float) = onWorker {
++    val level = value.coerceIn(0f, 1f)
++    runCatching { channel.setVolume(level.toDouble()) }
++      .onSuccess { volume = level }
++      .onFailure { Log.w(TAG, "SET_VOLUME failed: ${it.message}") }
++  }
++
++  override fun close() {
++    if (closed) return
++    closed = true
++    poller.shutdownNow()
++    worker.execute {
++      mediaSessionId?.let { id -> runCatching { mediaRequest(JSONObject().put("type", "STOP").put("mediaSessionId", id)) } }
++      leases.revokeAll()
++      channel.close()
++      runCatching { keepAwake?.close() }
++    }
++    worker.shutdown()
++  }
++
++  // ---- internals (worker thread) ----
++
++  private fun loadIndex(i: Int, positionMs: Long, autoplay: Boolean) {
++    val item = queue.getOrNull(i) ?: return
++    leases.revokeAll()
++    val client = channel.remoteAddress
++    val source = item.uri.toString()
++    val url = leases.lease(source, item.headers.orEmpty(), item.contentType, client)
++    val art = item.artwork?.toString()?.takeIf { it.startsWith("http") || it.startsWith("file:") }
++      ?.let { leases.lease(it, item.headers.orEmpty(), null, client) }
++    val metadata = JSONObject().put("metadataType", 3)
++    item.title?.let { metadata.put("title", it) }
++    item.artist?.let { metadata.put("artist", it) }
++    item.album?.let { metadata.put("albumName", it) }
++    art?.let { metadata.put("images", JSONArray().put(JSONObject().put("url", it))) }
++    setIndex(i)
++    loadedUrl = url
++    finishHandled = false
++    mediaSessionId = null
++    _state.value = RemotePlaybackState.LOADING
++    _positionMs.value = positionMs
++    _durationMs.value = item.durationMs ?: 0L
++    val reply = mediaRequest(JSONObject().put("type", "LOAD").put("autoplay", autoplay)
++      .put("currentTime", positionMs / 1000.0)
++      .put("media", JSONObject().put("contentId", url)
++        .put("contentType", item.contentType ?: MediaInfoBuilder.guessContentType(source))
++        .put("streamType", "BUFFERED").put("metadata", metadata)))
++    if (reply == null || reply.optString("type") != "MEDIA_STATUS") {
++      _state.value = RemotePlaybackState.ERROR
++      _mediaError.tryEmit(RemoteMediaError(-1, "Receiver did not load the track"))
++    }
++  }
++
++  private fun applyStatus(payload: JSONObject) {
++    val status = payload.optJSONArray("status")?.optJSONObject(0) ?: return
++    val contentId = status.optJSONObject("media")?.optString("contentId")
++    if (!contentId.isNullOrEmpty() && contentId != loadedUrl) return // stale or another sender's media
++    status.optInt("mediaSessionId").takeIf { it > 0 }?.let { mediaSessionId = it }
++    hasReportedState = true
++    _positionMs.value = (status.optDouble("currentTime", 0.0) * 1000).toLong()
++    status.optJSONObject("media")?.optDouble("duration")?.takeIf { !it.isNaN() && it > 0 }
++      ?.let { _durationMs.value = (it * 1000).toLong() }
++    when (status.optString("playerState")) {
++      "PLAYING" -> _state.value = RemotePlaybackState.PLAYING
++      "PAUSED" -> _state.value = RemotePlaybackState.PAUSED
++      "BUFFERING" -> _state.value = RemotePlaybackState.BUFFERING
++      "IDLE" -> when (status.optString("idleReason")) {
++        "FINISHED" -> onTrackFinished()
++        "ERROR" -> {
++          _state.value = RemotePlaybackState.ERROR
++          _mediaError.tryEmit(RemoteMediaError(-1, "Receiver could not play the track"))
++        }
++        else -> _state.value = RemotePlaybackState.IDLE
++      }
++    }
++  }
++
++  private fun onTrackFinished() {
++    if (finishHandled) return
++    finishHandled = true
++    val next = when {
++      repeat == RemoteRepeatMode.SINGLE -> index
++      index + 1 < queue.size -> index + 1
++      repeat == RemoteRepeatMode.ALL && queue.isNotEmpty() -> 0
++      else -> -1
++    }
++    if (next >= 0) {
++      loadIndex(next, 0, true)
++    } else {
++      _state.value = RemotePlaybackState.ENDED
++      _endedReason.tryEmit(RemoteEndReason.FINISHED)
++    }
++  }
++
++  private fun clearPlayback() {
++    mediaSessionId?.let { id -> mediaRequest(JSONObject().put("type", "STOP").put("mediaSessionId", id)) }
++    leases.revokeAll()
++    mediaSessionId = null
++    loadedUrl = null
++    setIndex(-1)
++    _state.value = RemotePlaybackState.IDLE
++  }
++
++  private fun setIndex(i: Int) {
++    index = i
++    _currentTrackIndex.value = i
++  }
++
++  private fun command(type: String) = onWorker {
++    val id = mediaSessionId ?: return@onWorker
++    mediaRequest(JSONObject().put("type", type).put("mediaSessionId", id))
++  }
++
++  /** Media request on the app transport; applies a MEDIA_STATUS reply. Null on failure. */
++  private fun mediaRequest(payload: JSONObject): JSONObject? {
++    if (closed && payload.optString("type") != "STOP") return null
++    return runCatching { channel.request(transport, CastChannel.NS_MEDIA, payload) }
++      .onFailure { Log.w(TAG, "${payload.optString("type")} failed: ${it.message}") }
++      .getOrNull()
++      ?.also { if (it.optString("type") == "MEDIA_STATUS") applyStatus(it) }
++  }
++
++  private fun onWorker(block: () -> Unit) {
++    if (worker.isShutdown) return
++    runCatching { worker.execute { runCatching(block).onFailure { Log.w(TAG, "cast command failed", it) } } }
++  }
++
++  private fun receiverGone(reason: String) {
++    if (closed) return
++    Log.i(TAG, "Receiver connection ended ($reason)")
++    deathListener?.invoke(reason)
++  }
++
++  private companion object {
++    const val TAG = "DirectCastSession"
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServer.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServer.kt
+new file mode 100644
+index 0000000..99d5032
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServer.kt
+@@ -0,0 +1,191 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import android.util.Log
++import java.io.File
++import java.io.InputStream
++import java.io.OutputStream
++import java.net.HttpURLConnection
++import java.net.InetAddress
++import java.net.ServerSocket
++import java.net.Socket
++import java.net.URI
++import java.net.URL
++import java.security.SecureRandom
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.ExecutorService
++import java.util.concurrent.Executors
++
++/**
++ * Local HTTP server that lets a self-hosted Cast receiver fetch the current
++ * track without learning the music server's URL or credentials. Each track
++ * gets a random, unguessable lease URL that only the receiver's address may
++ * fetch; the server proxies http(s) sources (forwarding `Range` so the
++ * receiver can seek) and serves downloaded `file:` sources directly.
++ */
++internal class MediaLeaseServer(private val bindAddress: InetAddress) : AutoCloseable {
++
++  private data class Lease(
++    val source: String,
++    val headers: Map<String, String>,
++    val contentType: String?,
++    val client: InetAddress,
++  )
++
++  private val leases = ConcurrentHashMap<String, Lease>()
++  private val random = SecureRandom()
++  private val socket = ServerSocket(0, 16, bindAddress)
++  private val workers: ExecutorService = Executors.newFixedThreadPool(MAX_CONNECTIONS) { r ->
++    Thread(r, "cast-lease").apply { isDaemon = true }
++  }
++  private val acceptor = Thread({ acceptLoop() }, "cast-lease-accept").apply {
++    isDaemon = true
++    start()
++  }
++
++  /** Issue a lease for [source] (http(s) or file URI) fetchable only by [client]. */
++  fun lease(source: String, headers: Map<String, String>, contentType: String?, client: InetAddress): String {
++    val token = ByteArray(24).also(random::nextBytes).joinToString("") { "%02x".format(it) }
++    leases[token] = Lease(source, headers, contentType, client)
++    val host = bindAddress.hostAddress.let { if (it.contains(':')) "[$it]" else it }
++    return "http://$host:${socket.localPort}/lease/$token"
++  }
++
++  fun revokeAll() = leases.clear()
++
++  override fun close() {
++    leases.clear()
++    runCatching { socket.close() }
++    workers.shutdownNow()
++  }
++
++  private fun acceptLoop() {
++    while (!socket.isClosed) {
++      val client = runCatching { socket.accept() }.getOrNull() ?: break
++      runCatching { workers.execute { client.use(::serve) } }.onFailure { client.close() }
++    }
++  }
++
++  private fun serve(client: Socket) {
++    client.soTimeout = 15_000
++    val input = client.getInputStream()
++    val out = client.getOutputStream()
++    val requestLine = readLine(input) ?: return
++    val headers = HashMap<String, String>()
++    while (true) {
++      val line = readLine(input) ?: return
++      if (line.isEmpty()) break
++      headers[line.substringBefore(':').trim().lowercase()] = line.substringAfter(':').trim()
++    }
++    val parts = requestLine.split(' ')
++    val method = parts.getOrNull(0) ?: return
++    val path = parts.getOrNull(1) ?: return
++    if (method != "GET" && method != "HEAD") return status(out, 405)
++    val lease = leases[path.removePrefix("/lease/").substringBefore('?')]
++      ?: return status(out, 404)
++    if (client.inetAddress != lease.client) return status(out, 403)
++    try {
++      if (lease.source.startsWith("file:")) {
++        serveFile(out, File(URI(lease.source)), lease.contentType, headers["range"], method == "HEAD")
++      } else {
++        proxy(out, lease, headers["range"], method)
++      }
++    } catch (t: Throwable) {
++      Log.w(TAG, "lease request failed: ${t.javaClass.simpleName}")
++    }
++  }
++
++  private fun proxy(out: OutputStream, lease: Lease, range: String?, method: String) {
++    val conn = URL(lease.source).openConnection() as HttpURLConnection
++    conn.requestMethod = method
++    conn.connectTimeout = 10_000
++    conn.readTimeout = 30_000
++    lease.headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
++    range?.let { conn.setRequestProperty("Range", it) }
++    try {
++      val code = conn.responseCode
++      val head = StringBuilder("HTTP/1.1 $code ${reason(code)}\r\n")
++      val type = conn.getHeaderField("Content-Type") ?: lease.contentType
++      type?.let { head.append("Content-Type: $it\r\n") }
++      for (name in listOf("Content-Length", "Content-Range", "Accept-Ranges")) {
++        conn.getHeaderField(name)?.let { head.append("$name: $it\r\n") }
++      }
++      head.append("Connection: close\r\n\r\n")
++      out.write(head.toString().toByteArray(Charsets.ISO_8859_1))
++      if (method == "GET") {
++        (if (code < 400) conn.inputStream else conn.errorStream)?.use { it.copyTo(out) }
++      }
++      out.flush()
++    } finally {
++      conn.disconnect()
++    }
++  }
++
++  private fun serveFile(out: OutputStream, file: File, type: String?, range: String?, headOnly: Boolean) {
++    if (!file.isFile) return status(out, 404)
++    val size = file.length()
++    var start = 0L
++    var end = size - 1
++    val partial = range != null
++    if (range != null) {
++      val spec = range.removePrefix("bytes=").split(',').first()
++      val a = spec.substringBefore('-')
++      val b = spec.substringAfter('-')
++      if (a.isEmpty()) {
++        start = (size - (b.toLongOrNull() ?: return status(out, 416))).coerceAtLeast(0)
++      } else {
++        start = a.toLongOrNull() ?: return status(out, 416)
++        if (b.isNotEmpty()) end = (b.toLongOrNull() ?: return status(out, 416)).coerceAtMost(size - 1)
++      }
++      if (start > end || start >= size) return status(out, 416)
++    }
++    val length = end - start + 1
++    val head = StringBuilder(if (partial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
++    head.append("Content-Type: ${type ?: "application/octet-stream"}\r\n")
++    head.append("Accept-Ranges: bytes\r\nContent-Length: $length\r\n")
++    if (partial) head.append("Content-Range: bytes $start-$end/$size\r\n")
++    head.append("Connection: close\r\n\r\n")
++    out.write(head.toString().toByteArray(Charsets.ISO_8859_1))
++    if (!headOnly) {
++      file.inputStream().use { input ->
++        input.skip(start)
++        val buf = ByteArray(64 * 1024)
++        var left = length
++        while (left > 0) {
++          val n = input.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
++          if (n < 0) break
++          out.write(buf, 0, n)
++          left -= n
++        }
++      }
++    }
++    out.flush()
++  }
++
++  private fun status(out: OutputStream, code: Int) {
++    out.write("HTTP/1.1 $code ${reason(code)}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
++      .toByteArray(Charsets.ISO_8859_1))
++    out.flush()
++  }
++
++  private fun reason(code: Int) = when (code) {
++    200 -> "OK"; 206 -> "Partial Content"; 403 -> "Forbidden"; 404 -> "Not Found"
++    405 -> "Method Not Allowed"; 416 -> "Range Not Satisfiable"; else -> "Status"
++  }
++
++  /** One CRLF-terminated header line, bounded; null on EOF or overflow. */
++  private fun readLine(input: InputStream): String? {
++    val sb = StringBuilder()
++    while (sb.length < 8192) {
++      val c = input.read()
++      if (c < 0) return null
++      if (c == '\n'.code) return sb.toString().trimEnd('\r')
++      sb.append(c.toChar())
++    }
++    return null
++  }
++
++  private companion object {
++    const val TAG = "MediaLeaseServer"
++    const val MAX_CONNECTIONS = 4
++  }
++}
 diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayAp1CryptoTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayAp1CryptoTest.kt
 new file mode 100644
 index 0000000..0fbb71b
@@ -1122,3 +2139,652 @@ index 0000000..0fbb71b
 +    assertEquals("0,4", AirPlayTxtParser.parse(mapOf("et" to "0,4")).encryptionTypes)
 +  }
 +}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastChannelTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastChannelTest.kt
+new file mode 100644
+index 0000000..936405b
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastChannelTest.kt
+@@ -0,0 +1,67 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import org.json.JSONObject
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertThrows
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.ConscryptMode
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++// The JDK TLS provider: Robolectric's Conscrypt needs java.net opened on JDK 17.
++@ConscryptMode(ConscryptMode.Mode.OFF)
++class CastChannelTest {
++
++  private val receiver = FakeCastReceiver()
++
++  @After
++  fun tearDown() = receiver.close()
++
++  @Test
++  fun `wrong pin closes the connection before anything is sent`() {
++    val wrong = "0".repeat(64)
++    assertThrows(CastPinMismatchException::class.java) {
++      CastChannel.open("127.0.0.1", receiver.port, wrong, timeoutMs = 3_000)
++    }
++    Thread.sleep(200)
++    assertEquals(0L, receiver.bytesReceived)
++  }
++
++  @Test
++  fun `launches the default media receiver and talks to its transport`() {
++    CastChannel.open("127.0.0.1", receiver.port, receiver.fingerprint, timeoutMs = 3_000).use { channel ->
++      val transport = channel.launchMediaApp()
++      assertEquals("garage-media", transport)
++      assertEquals(listOf("LAUNCH"), receiver.types("receiver").filter { it == "LAUNCH" })
++      assertTrue("connects to the platform and the app", receiver.types("connection").size >= 2)
++
++      val status = channel.request(transport, CastChannel.NS_MEDIA, JSONObject().put("type", "GET_STATUS"))
++      assertEquals("MEDIA_STATUS", status.getString("type"))
++    }
++  }
++
++  @Test
++  fun `colon-separated uppercase pins are accepted`() {
++    val pin = receiver.fingerprint.uppercase().chunked(2).joinToString(":")
++    CastChannel.open("127.0.0.1", receiver.port, pin, timeoutMs = 3_000).close()
++  }
++
++  @Test
++  fun `answers receiver heartbeats and reports unsolicited messages`() {
++    CastChannel.open("127.0.0.1", receiver.port, receiver.fingerprint, timeoutMs = 3_000).use { channel ->
++      val transport = channel.launchMediaApp()
++      channel.request(transport, CastChannel.NS_MEDIA, JSONObject().put("type", "LOAD")
++        .put("media", JSONObject().put("contentId", "http://x/a")))
++      val seen = java.util.concurrent.LinkedBlockingQueue<JSONObject>()
++      channel.onUnsolicited = { _, payload -> seen.add(payload) }
++      receiver.broadcastStatus()
++      val pushed = seen.poll(2, java.util.concurrent.TimeUnit.SECONDS)
++      assertEquals("MEDIA_STATUS", pushed?.getString("type"))
++    }
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastMessageCodecTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastMessageCodecTest.kt
+new file mode 100644
+index 0000000..e11c971
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastMessageCodecTest.kt
+@@ -0,0 +1,59 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import org.junit.Assert.assertArrayEquals
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++class CastMessageCodecTest {
++
++  private fun hex(s: String) = s.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
++
++  @Test
++  fun `encodes a framed CastMessage with string payload`() {
++    val framed = CastMessageCodec.encode(
++      CastMessage("sender-0", "receiver-0", "urn:x-cast:com.google.cast.tp.heartbeat", """{"type":"PING"}"""),
++    )
++    val body = framed.copyOfRange(4, framed.size)
++    assertEquals(body.size, java.nio.ByteBuffer.wrap(framed, 0, 4).int)
++    // protocol_version = 0, source, destination, namespace, payload_type = 0, payload
++    val expected = hex("0800") +
++      hex("1208") + "sender-0".toByteArray() +
++      hex("1a0a") + "receiver-0".toByteArray() +
++      hex("2227") + "urn:x-cast:com.google.cast.tp.heartbeat".toByteArray() +
++      hex("2800") +
++      hex("320f") + """{"type":"PING"}""".toByteArray()
++    assertArrayEquals(expected, body)
++  }
++
++  @Test
++  fun `decodes fields in any order, as the garage receiver writes them`() {
++    // receiver.py: 08 00, fields 2,3,4,6, then 28 00.
++    val payload = """{"type":"PONG"}"""
++    val body = hex("0800") +
++      hex("120a") + "receiver-0".toByteArray() +
++      hex("1a08") + "sender-0".toByteArray() +
++      hex("2227") + "urn:x-cast:com.google.cast.tp.heartbeat".toByteArray() +
++      hex("320f") + payload.toByteArray() +
++      hex("2800")
++    val msg = CastMessageCodec.decode(body)!!
++    assertEquals("receiver-0", msg.source)
++    assertEquals("sender-0", msg.destination)
++    assertEquals("urn:x-cast:com.google.cast.tp.heartbeat", msg.namespace)
++    assertEquals(payload, msg.payload)
++  }
++
++  @Test
++  fun `round trips long payloads with multi-byte lengths`() {
++    val payload = "x".repeat(300)
++    val framed = CastMessageCodec.encode(CastMessage("a", "b", "ns", payload))
++    assertEquals(payload, CastMessageCodec.decode(framed.copyOfRange(4, framed.size))!!.payload)
++  }
++
++  @Test
++  fun `rejects truncated or binary-payload messages`() {
++    assertNull(CastMessageCodec.decode(hex("0800120a72")))
++    // payload_type = 1 (binary) is not used by the media protocol.
++    assertNull(CastMessageCodec.decode(hex("08002801")))
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastPinTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastPinTest.kt
+new file mode 100644
+index 0000000..3171aaf
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastPinTest.kt
+@@ -0,0 +1,36 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class CastPinTest {
++
++  private val garage = "874a96ab4628f649e37176b35473642daf151d9f04b57bcc539d90fa81ba3824"
++
++  @Test
++  fun `normalises case, colons and spaces`() {
++    val colons = garage.uppercase().chunked(2).joinToString(":")
++    assertEquals(garage, CastPin.normalize(colons))
++    assertEquals(garage, CastPin.normalize(" $garage "))
++  }
++
++  @Test
++  fun `rejects anything that is not a full SHA-256`() {
++    assertNull(CastPin.normalize(garage.dropLast(5))) // a truncated paste
++    assertNull(CastPin.normalize(garage.dropLast(1) + "g"))
++    assertNull(CastPin.normalize(""))
++  }
++
++  @Test
++  fun `matches the SHA-256 of the certificate DER`() {
++    val der = "certificate bytes".toByteArray()
++    val digest = java.security.MessageDigest.getInstance("SHA-256").digest(der)
++      .joinToString("") { "%02x".format(it) }
++    assertTrue(CastPin.matches(der, digest.uppercase()))
++    assertFalse(CastPin.matches(der, garage))
++    assertFalse(CastPin.matches(der, "not a pin"))
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSessionTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSessionTest.kt
+new file mode 100644
+index 0000000..34b10ea
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSessionTest.kt
+@@ -0,0 +1,141 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import android.net.Uri
++import com.margelo.nitro.queueplayer.cast.CastMediaItem
++import com.margelo.nitro.queueplayer.cast.RemoteEndReason
++import com.margelo.nitro.queueplayer.cast.RemotePlaybackState
++import com.margelo.nitro.queueplayer.cast.RemoteRepeatMode
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.ConscryptMode
++import java.net.InetAddress
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++@ConscryptMode(ConscryptMode.Mode.OFF)
++class DirectCastSessionTest {
++
++  private val receiver = FakeCastReceiver()
++  private val leases = MediaLeaseServer(InetAddress.getByName("127.0.0.1"))
++  private val channel = CastChannel.open("127.0.0.1", receiver.port, receiver.fingerprint, timeoutMs = 3_000)
++  private val session = DirectCastSession(channel, channel.launchMediaApp(), leases, pollMs = 100)
++
++  private val tracks = listOf("a", "b", "c").map {
++    CastMediaItem(uri = Uri.parse("https://music.example/rest/stream?id=$it&t=secret"), title = "Song $it", artist = "Band")
++  }
++
++  @After
++  fun tearDown() {
++    session.close()
++    leases.close()
++    receiver.close()
++  }
++
++  private fun waitFor(what: String, condition: () -> Boolean) {
++    val deadline = System.currentTimeMillis() + 3_000
++    while (!condition()) {
++      if (System.currentTimeMillis() > deadline) throw AssertionError("timed out waiting for $what")
++      Thread.sleep(20)
++    }
++  }
++
++  @Test
++  fun `loads the start track through a lease, never the server URL`() = runBlocking {
++    session.load(tracks, startIndex = 1, startPositionMs = 30_000, playWhenReady = true)
++    waitFor("LOAD") { receiver.contentId != null }
++    val url = receiver.contentId!!
++    assertTrue(url, url.startsWith("http://127.0.0.1:") && url.contains("/lease/"))
++    assertFalse(url.contains("secret"))
++    val load = receiver.received.last { it.optString("type") == "LOAD" }
++    assertEquals(30.0, load.getDouble("currentTime"), 0.01)
++    assertEquals("Song b", load.getJSONObject("media").getJSONObject("metadata").getString("title"))
++    waitFor("playing") { session.state.value == RemotePlaybackState.PLAYING }
++    assertEquals(1, session.currentTrackIndex.value)
++    assertTrue(session.hasReportedState)
++  }
++
++  @Test
++  fun `transport commands reach the receiver's media session`() = runBlocking {
++    session.load(tracks, 0, 0, true)
++    waitFor("playing") { session.state.value == RemotePlaybackState.PLAYING }
++    session.pause()
++    waitFor("paused") { receiver.playerState == "PAUSED" }
++    session.seekTo(42_000)
++    waitFor("seek") { receiver.currentTime == 42.0 }
++    session.play()
++    waitFor("play") { receiver.playerState == "PLAYING" }
++    val sessionIds = receiver.received.filter { it.optString("type") in setOf("PAUSE", "SEEK", "PLAY") }
++      .map { it.optInt("mediaSessionId") }
++    assertEquals(listOf(1, 1, 1), sessionIds)
++  }
++
++  @Test
++  fun `seeking while paused stays paused`() = runBlocking {
++    session.load(tracks, 0, 0, true)
++    waitFor("playing") { session.state.value == RemotePlaybackState.PLAYING }
++    session.pause()
++    waitFor("paused") { session.state.value == RemotePlaybackState.PAUSED }
++    session.seekTo(60_000)
++    waitFor("seek") { receiver.currentTime == 60.0 }
++    val seek = receiver.received.last { it.optString("type") == "SEEK" }
++    assertEquals("PLAYBACK_PAUSE", seek.optString("resumeState"))
++  }
++
++  @Test
++  fun `advances to the next track when the receiver finishes one`() = runBlocking {
++    session.load(tracks, 0, 0, true)
++    waitFor("first") { receiver.mediaSession == 1 }
++    val first = receiver.contentId
++    receiver.playerState = "IDLE"; receiver.idleReason = "FINISHED"
++    receiver.broadcastStatus()
++    waitFor("second LOAD") { receiver.mediaSession == 2 }
++    assertTrue(receiver.contentId != first)
++    waitFor("index 1") { session.currentTrackIndex.value == 1 }
++  }
++
++  @Test
++  fun `ends after the last track unless repeating`() = runBlocking {
++    val ended = CountDownLatch(1)
++    val job = kotlinx.coroutines.GlobalScope.launch { session.endedReason.collect { if (it == RemoteEndReason.FINISHED) ended.countDown() } }
++    session.load(tracks, 2, 0, true)
++    waitFor("loaded") { receiver.mediaSession == 1 }
++    receiver.playerState = "IDLE"; receiver.idleReason = "FINISHED"
++    receiver.broadcastStatus()
++    assertTrue(ended.await(3, TimeUnit.SECONDS))
++    assertEquals(RemotePlaybackState.ENDED, session.state.value)
++    job.cancel()
++
++    session.setRepeatMode(RemoteRepeatMode.ALL)
++    session.load(tracks, 2, 0, true)
++    waitFor("reloaded") { receiver.mediaSession == 2 }
++    receiver.playerState = "IDLE"; receiver.idleReason = "FINISHED"
++    receiver.broadcastStatus()
++    waitFor("wrapped") { receiver.mediaSession == 3 && session.currentTrackIndex.value == 0 }
++  }
++
++  @Test
++  fun `sets receiver volume and reports it`() {
++    session.setVolume(0.25f)
++    waitFor("receiver volume") { receiver.volume == 0.25 }
++    waitFor("session volume") { session.volume == 0.25f }
++  }
++
++  @Test
++  fun `reports the receiver going away`() {
++    val died = CountDownLatch(1)
++    session.deathListener = { died.countDown() }
++    receiver.close()
++    receiver.dropClients()
++    assertTrue(died.await(3, TimeUnit.SECONDS))
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastTargetTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastTargetTest.kt
+new file mode 100644
+index 0000000..4552c55
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastTargetTest.kt
+@@ -0,0 +1,29 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++class DirectCastTargetTest {
++
++  @Test
++  fun `parses host, port and url-encoded name`() {
++    assertEquals(
++      DirectCastTarget("192.168.1.17", 8009, "Garage Cast"),
++      DirectCastTarget.parse("castdirect:192.168.1.17:8009:Garage%20Cast"),
++    )
++  }
++
++  @Test
++  fun `name is optional and defaults to the host`() {
++    assertEquals(DirectCastTarget("garage.lan", 8009, "garage.lan"), DirectCastTarget.parse("castdirect:garage.lan:8009"))
++  }
++
++  @Test
++  fun `rejects other ids and bad ports`() {
++    assertNull(DirectCastTarget.parse("chromecast:abc"))
++    assertNull(DirectCastTarget.parse("castdirect:host:notaport:x"))
++    assertNull(DirectCastTarget.parse("castdirect:host:70000:x"))
++    assertNull(DirectCastTarget.parse("castdirect::8009:x"))
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/FakeCastReceiver.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/FakeCastReceiver.kt
+new file mode 100644
+index 0000000..5ce01da
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/FakeCastReceiver.kt
+@@ -0,0 +1,148 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.DataInputStream
++import java.io.OutputStream
++import java.net.InetAddress
++import java.security.KeyStore
++import java.util.concurrent.CopyOnWriteArrayList
++import javax.net.ssl.KeyManagerFactory
++import javax.net.ssl.SSLContext
++import javax.net.ssl.SSLServerSocket
++import kotlin.concurrent.thread
++
++/**
++ * TLS Cast receiver for tests, modelled on the garage `receiver.py`: Default
++ * Media Receiver only, single-item LOAD, PLAY/PAUSE/SEEK/STOP/GET_STATUS,
++ * receiver SET_VOLUME. [bytesReceived] counts everything the client sent, so a
++ * test can assert nothing was sent before the certificate pin was checked.
++ */
++class FakeCastReceiver : AutoCloseable {
++
++  val fingerprint: String =
++    javaClass.getResource("/cast/receiver.sha256")!!.readText().trim()
++  val received = CopyOnWriteArrayList<JSONObject>()
++  @Volatile var bytesReceived = 0L
++  @Volatile var playerState = "IDLE"
++  @Volatile var idleReason: String? = null
++  @Volatile var currentTime = 0.0
++  @Volatile var volume = 1.0
++  @Volatile var mediaSession = 0
++  @Volatile var contentId: String? = null
++
++  private val server: SSLServerSocket
++  private val clients = CopyOnWriteArrayList<java.net.Socket>()
++  private var out: OutputStream? = null
++
++  init {
++    val ks = KeyStore.getInstance("PKCS12")
++    javaClass.getResourceAsStream("/cast/receiver.p12")!!.use { ks.load(it, "test".toCharArray()) }
++    val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
++    kmf.init(ks, "test".toCharArray())
++    val ctx = SSLContext.getInstance("TLS").apply { init(kmf.keyManagers, null, null) }
++    server = ctx.serverSocketFactory.createServerSocket(0, 4, InetAddress.getByName("127.0.0.1")) as SSLServerSocket
++    thread(isDaemon = true) { acceptLoop() }
++  }
++
++  val port: Int get() = server.localPort
++
++  fun types(namespaceSuffix: String): List<String> =
++    received.filter { it.optString("_ns").endsWith(namespaceSuffix) }.map { it.optString("type") }
++
++  /** Push an unsolicited MEDIA_STATUS, as a receiver does when a track ends. */
++  fun broadcastStatus() = synchronized(this) { out?.let { send(it, "garage-media", MEDIA, mediaStatus(0)) } }
++
++  private fun acceptLoop() {
++    while (!server.isClosed) {
++      val sock = runCatching { server.accept() }.getOrNull() ?: break
++      clients += sock
++      thread(isDaemon = true) {
++        runCatching {
++          sock.use { s ->
++            val input = DataInputStream(s.getInputStream())
++            synchronized(this) { out = s.getOutputStream() }
++            while (true) {
++              val len = input.readInt()
++              val body = ByteArray(len).also { input.readFully(it) }
++              bytesReceived += 4 + len
++              val msg = CastMessageCodec.decode(body) ?: break
++              val json = JSONObject(msg.payload).put("_ns", msg.namespace).put("_dst", msg.destination)
++              received += json
++              val reply = handle(msg.namespace, json) ?: continue
++              synchronized(this) { send(s.getOutputStream(), msg.destination, msg.namespace, reply) }
++            }
++          }
++        }
++      }
++    }
++  }
++
++  private fun handle(ns: String, p: JSONObject): JSONObject? {
++    val id = p.optInt("requestId")
++    return when (ns) {
++      HEARTBEAT -> if (p.optString("type") == "PING") JSONObject().put("type", "PONG") else null
++      RECEIVER -> when {
++        p.optString("type") == "LAUNCH" && p.optString("appId") != "CC1AD845" ->
++          JSONObject().put("type", "LAUNCH_ERROR").put("requestId", id).put("reason", "APP_NOT_FOUND")
++        else -> {
++          if (p.optString("type") == "SET_VOLUME") volume = p.getJSONObject("volume").optDouble("level", volume)
++          JSONObject().put("type", "RECEIVER_STATUS").put("requestId", id).put("status", JSONObject()
++            .put("applications", JSONArray().put(JSONObject().put("appId", "CC1AD845")
++              .put("sessionId", "garage").put("transportId", "garage-media")))
++            .put("volume", JSONObject().put("level", volume).put("muted", false)))
++        }
++      }
++      MEDIA -> {
++        when (p.optString("type")) {
++          "LOAD" -> {
++            mediaSession++
++            contentId = p.getJSONObject("media").optString("contentId")
++            currentTime = p.optDouble("currentTime", 0.0)
++            playerState = if (p.optBoolean("autoplay", true)) "PLAYING" else "PAUSED"
++            idleReason = null
++          }
++          "PLAY" -> playerState = "PLAYING"
++          "PAUSE" -> playerState = "PAUSED"
++          "SEEK" -> {
++            // receiver.py: playback resumes unless resumeState is PLAYBACK_PAUSE.
++            currentTime = p.optDouble("currentTime")
++            playerState = if (p.optString("resumeState") == "PLAYBACK_PAUSE") "PAUSED" else "PLAYING"
++          }
++          "STOP" -> { playerState = "IDLE"; idleReason = "CANCELLED" }
++        }
++        mediaStatus(id)
++      }
++      else -> null
++    }
++  }
++
++  private fun mediaStatus(requestId: Int): JSONObject {
++    val status = JSONArray()
++    if (mediaSession > 0) {
++      val s = JSONObject().put("mediaSessionId", mediaSession).put("playerState", playerState)
++        .put("currentTime", currentTime).put("media", JSONObject().put("contentId", contentId).put("duration", 180.0))
++      idleReason?.let { s.put("idleReason", it) }
++      status.put(s)
++    }
++    return JSONObject().put("type", "MEDIA_STATUS").put("requestId", requestId).put("status", status)
++  }
++
++  private fun send(out: OutputStream, destination: String, ns: String, payload: JSONObject) {
++    out.write(CastMessageCodec.encode(CastMessage(destination, "sender-0", ns, payload.toString())))
++    out.flush()
++  }
++
++  /** Drop every client connection, as when the receiver restarts. */
++  fun dropClients() = clients.forEach { runCatching { it.close() } }
++
++  override fun close() {
++    runCatching { server.close() }
++  }
++
++  companion object {
++    const val HEARTBEAT = "urn:x-cast:com.google.cast.tp.heartbeat"
++    const val RECEIVER = "urn:x-cast:com.google.cast.receiver"
++    const val MEDIA = "urn:x-cast:com.google.cast.media"
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServerTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServerTest.kt
+new file mode 100644
+index 0000000..2296f85
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServerTest.kt
+@@ -0,0 +1,116 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import org.junit.After
++import org.junit.Assert.assertArrayEquals
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Test
++import java.io.File
++import java.net.HttpURLConnection
++import java.net.InetAddress
++import java.net.ServerSocket
++import kotlin.concurrent.thread
++import java.net.URL
++
++class MediaLeaseServerTest {
++
++  private val loopback = InetAddress.getByName("127.0.0.1")
++  private val audio = ByteArray(10_000) { (it % 251).toByte() }
++  private lateinit var upstream: ServerSocket
++  private val upstreamHeaders = mutableListOf<Map<String, String>>()
++  private lateinit var server: MediaLeaseServer
++
++  /** Minimal range-capable HTTP/1.1 origin standing in for the music server. */
++  private fun serveUpstream() = thread(isDaemon = true) {
++    while (!upstream.isClosed) {
++      val sock = runCatching { upstream.accept() }.getOrNull() ?: break
++      sock.use { s ->
++        val reader = s.getInputStream().bufferedReader(Charsets.ISO_8859_1)
++        reader.readLine() ?: return@use
++        val headers = generateSequence { reader.readLine()?.takeIf { it.isNotEmpty() } }
++          .associate { it.substringBefore(':').trim().lowercase() to it.substringAfter(':').trim() }
++        upstreamHeaders += headers
++        val start = headers["range"]?.removePrefix("bytes=")?.substringBefore('-')?.toInt()
++        val from = start ?: 0
++        val head = StringBuilder()
++        head.append(if (start != null) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
++        head.append("Content-Type: audio/flac\r\nAccept-Ranges: bytes\r\n")
++        if (start != null) head.append("Content-Range: bytes $from-${audio.size - 1}/${audio.size}\r\n")
++        head.append("Content-Length: ${audio.size - from}\r\nConnection: close\r\n\r\n")
++        s.getOutputStream().write(head.toString().toByteArray())
++        s.getOutputStream().write(audio, from, audio.size - from)
++      }
++    }
++  }
++
++  @Before
++  fun setUp() {
++    upstream = ServerSocket(0, 50, loopback)
++    serveUpstream()
++    server = MediaLeaseServer(loopback)
++  }
++
++  @After
++  fun tearDown() {
++    server.close()
++    upstream.close()
++  }
++
++  private fun upstreamUrl() = "http://127.0.0.1:${upstream.localPort}/rest/stream?id=1&t=secret"
++
++  private fun fetch(url: String, range: String? = null): Triple<Int, Map<String, String>, ByteArray> {
++    val c = URL(url).openConnection() as HttpURLConnection
++    range?.let { c.setRequestProperty("Range", it) }
++    val code = c.responseCode
++    val body = (if (code < 400) c.inputStream else c.errorStream)?.use { it.readBytes() } ?: ByteArray(0)
++    val headers = c.headerFields.filterKeys { it != null }.mapValues { it.value.first() }
++    return Triple(code, headers, body)
++  }
++
++  @Test
++  fun `serves the upstream bytes through a lease without exposing its URL`() {
++    val url = server.lease(upstreamUrl(), mapOf("X-Token" to "abc"), "audio/flac", loopback)
++    assertTrue(!url.contains("secret") && !url.contains("rest/stream"))
++    val (code, headers, body) = fetch(url)
++    assertEquals(200, code)
++    assertEquals("audio/flac", headers["Content-Type"])
++    assertArrayEquals(audio, body)
++    assertEquals("abc", upstreamHeaders.last()["x-token"])
++  }
++
++  @Test
++  fun `passes Range through so the receiver can seek`() {
++    val url = server.lease(upstreamUrl(), emptyMap(), null, loopback)
++    val (code, headers, body) = fetch(url, "bytes=4000-")
++    assertEquals(206, code)
++    assertEquals("bytes 4000-9999/10000", headers["Content-Range"])
++    assertArrayEquals(audio.copyOfRange(4000, audio.size), body)
++  }
++
++  @Test
++  fun `only the receiver it was issued to may fetch a lease`() {
++    val url = server.lease(upstreamUrl(), emptyMap(), null, InetAddress.getByName("10.9.9.9"))
++    assertEquals(403, fetch(url).first)
++    assertTrue(upstreamHeaders.isEmpty())
++  }
++
++  @Test
++  fun `unknown and revoked leases are not found`() {
++    val url = server.lease(upstreamUrl(), emptyMap(), null, loopback)
++    assertEquals(404, fetch(url.substringBeforeLast('/') + "/nope").first)
++    server.revokeAll()
++    assertEquals(404, fetch(url).first)
++  }
++
++  @Test
++  fun `serves downloaded files with ranges`() {
++    val file = File.createTempFile("track", ".flac").apply { writeBytes(audio); deleteOnExit() }
++    val url = server.lease(file.toURI().toString(), emptyMap(), "audio/flac", loopback)
++    val (code, headers, body) = fetch(url, "bytes=100-199")
++    assertEquals(206, code)
++    assertEquals("bytes 100-199/10000", headers["Content-Range"])
++    assertArrayEquals(audio.copyOfRange(100, 200), body)
++    assertArrayEquals(audio, fetch(url).third)
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/resources/cast/receiver.p12 b/node_modules/react-native-queue-player/android/src/test/resources/cast/receiver.p12
+new file mode 100644
+index 0000000..24de20a
+Binary files /dev/null and b/node_modules/react-native-queue-player/android/src/test/resources/cast/receiver.p12 differ
+diff --git a/node_modules/react-native-queue-player/android/src/test/resources/cast/receiver.sha256 b/node_modules/react-native-queue-player/android/src/test/resources/cast/receiver.sha256
+new file mode 100644
+index 0000000..b6182ff
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/resources/cast/receiver.sha256
+@@ -0,0 +1 @@
++128cc3c5180ad9baf67aeebcb2949290409a5f0596c481b739c3e612c5d28f62

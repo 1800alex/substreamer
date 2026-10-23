@@ -7,6 +7,7 @@ import { useTranslation } from 'react-i18next';
 import { BottomChrome } from '../components/BottomChrome';
 import { GradientBackground } from '../components/GradientBackground';
 import { BackgroundPlaybackCard } from '../components/settings/BackgroundPlaybackCard';
+import { CastReceiversCard } from '../components/settings/CastReceiversCard';
 import { DownloadingCard } from '../components/settings/DownloadingCard';
 import { EqualizerCard } from '../components/settings/EqualizerCard';
 import { LookaheadCacheCard } from '../components/settings/LookaheadCacheCard';
@@ -111,6 +112,7 @@ export function SettingsPlaybackScreen() {
           <PlaybackModeCard />
           <LookaheadCacheCard />
           <PlayerControlsCard />
+          <CastReceiversCard />
           <SkipIntervalsCard />
           <RemoteControlsCard />
           {/* Battery-optimization exemption — affects background playback, so it
