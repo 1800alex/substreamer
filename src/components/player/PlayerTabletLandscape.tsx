@@ -28,6 +28,7 @@ import { FavoriteButton } from '@/components/FavoriteButton';
 import { MarqueeText } from '@/components/MarqueeText';
 import { MoreOptionsButton } from '@/components/MoreOptionsButton';
 import { PlaybackRateButton } from '@/components/PlaybackRateButton';
+import { SecondaryControlsGrid } from './SecondaryControlsGrid';
 import { PlayerProgressBar } from '@/components/PlayerProgressBar';
 import { QueueItemRow } from '@/components/QueueItemRow';
 import { RepeatButton } from '@/components/RepeatButton';
@@ -89,6 +90,7 @@ export function PlayerTabletLandscape({
 
   const showSkipInterval = playbackSettingsStore((s) => s.showSkipIntervalButtons);
   const showSleepTimer = playbackSettingsStore((s) => s.showSleepTimerButton);
+  const showVolumeButton = playbackSettingsStore((s) => s.showVolumeButton);
   const offlineMode = offlineModeStore((s) => s.offlineMode);
   // This overlay is root-mounted and stays mounted (transparent, non-interactive)
   // while collapsed, so "the player is open" is the expanded flag, not the mount.
@@ -426,23 +428,29 @@ export function PlayerTabletLandscape({
               {/* Secondary controls row — sleep timer, then skip-interval
                   buttons under prev/next with the playback rate between them */}
               <View style={styles.secondaryControls}>
-                <View style={[styles.controlSideLeft, styles.secondaryLeftInset]}>
-                  {showSleepTimer && <SleepTimerButton />}
-                </View>
-                <View style={[styles.secondaryCenter, styles.secondaryCenterRow]}>
-                  {showSkipInterval && (
-                    <SkipIntervalButton direction="backward" size={32} />
-                  )}
-                  <View style={styles.secondaryRateSlot}>
-                    <PlaybackRateButton />
-                  </View>
-                  {showSkipInterval && (
-                    <SkipIntervalButton direction="forward" size={32} />
-                  )}
-                </View>
-                <View style={styles.controlSideRight}>
-                  <BookmarkButton style={styles.bookmarkButton} />
-                </View>
+                {showVolumeButton ? (
+                  <SecondaryControlsGrid />
+                ) : (
+                  <>
+                    <View style={[styles.controlSideLeft, styles.secondaryLeftInset]}>
+                      {showSleepTimer && <SleepTimerButton />}
+                    </View>
+                    <View style={[styles.secondaryCenter, styles.secondaryCenterRow]}>
+                      {showSkipInterval && (
+                        <SkipIntervalButton direction="backward" size={32} />
+                      )}
+                      <View style={styles.secondaryRateSlot}>
+                        <PlaybackRateButton />
+                      </View>
+                      {showSkipInterval && (
+                        <SkipIntervalButton direction="forward" size={32} />
+                      )}
+                    </View>
+                    <View style={styles.controlSideRight}>
+                      <BookmarkButton style={styles.bookmarkButton} />
+                    </View>
+                  </>
+                )}
               </View>
 
               {/* Quality badge */}

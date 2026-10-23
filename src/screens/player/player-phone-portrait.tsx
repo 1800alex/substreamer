@@ -33,6 +33,7 @@ import { EmptyState } from '@/components/EmptyState';
 import { MarqueeText } from '@/components/MarqueeText';
 import { MoreOptionsButton } from '@/components/MoreOptionsButton';
 import { PlaybackRateButton } from '@/components/PlaybackRateButton';
+import { SecondaryControlsGrid } from '@/components/player/SecondaryControlsGrid';
 import { PlayerProgressBar } from '@/components/PlayerProgressBar';
 import { PlayerTabBar, type PlayerTab } from '@/components/PlayerTabBar';
 import { RepeatButton } from '@/components/RepeatButton';
@@ -473,6 +474,7 @@ const PlayerContent = memo(function PlayerContent({
 
   const showSkipInterval = playbackSettingsStore((s) => s.showSkipIntervalButtons);
   const showSleepTimer = playbackSettingsStore((s) => s.showSleepTimerButton);
+  const showVolumeButton = playbackSettingsStore((s) => s.showVolumeButton);
   const { canSkipNext, canSkipPrevious } = useCanSkip();
 
   // Content-height budget (window minus header + top/bottom safe-area insets)
@@ -666,23 +668,29 @@ const PlayerContent = memo(function PlayerContent({
         <>
           <View style={styles.playerSpacer} />
           <View style={styles.secondaryControls}>
-            <View style={[styles.controlSideLeft, styles.secondaryLeftInset]}>
-              {showSleepTimer && <SleepTimerButton />}
-            </View>
-            <View style={[styles.secondaryCenterRow, { width: secondaryCenterWidth }]}>
-              {showSkipInterval && (
-                <SkipIntervalButton direction="backward" size={32} />
-              )}
-              <View style={styles.secondaryRateSlot}>
-                <PlaybackRateButton />
-              </View>
-              {showSkipInterval && (
-                <SkipIntervalButton direction="forward" size={32} />
-              )}
-            </View>
-            <View style={styles.controlSideRight}>
-              <BookmarkButton style={styles.favoriteButton} />
-            </View>
+            {showVolumeButton ? (
+              <SecondaryControlsGrid />
+            ) : (
+              <>
+                <View style={[styles.controlSideLeft, styles.secondaryLeftInset]}>
+                  {showSleepTimer && <SleepTimerButton />}
+                </View>
+                <View style={[styles.secondaryCenterRow, { width: secondaryCenterWidth }]}>
+                  {showSkipInterval && (
+                    <SkipIntervalButton direction="backward" size={32} />
+                  )}
+                  <View style={styles.secondaryRateSlot}>
+                    <PlaybackRateButton />
+                  </View>
+                  {showSkipInterval && (
+                    <SkipIntervalButton direction="forward" size={32} />
+                  )}
+                </View>
+                <View style={styles.controlSideRight}>
+                  <BookmarkButton style={styles.favoriteButton} />
+                </View>
+              </>
+            )}
           </View>
         </>
       )}

@@ -125,6 +125,8 @@ const cast = {
   showSystemPicker: jest.fn(() => Promise.resolve()),
   getLocalNetworkPermissionState: jest.fn(() => 'granted'),
   requestLocalNetworkPermission: jest.fn(() => Promise.resolve('granted')),
+  getRouteVolume: jest.fn(() => NaN),
+  setRouteVolume: jest.fn(() => Promise.resolve()),
   CastErrorCodes: { CONNECT_FAILED: 'cast_connect_failed', AUTH_REQUIRED: 'cast_auth_required' },
 };
 

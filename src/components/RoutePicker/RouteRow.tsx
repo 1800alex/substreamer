@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
+import { OutputVolumeSlider } from '../OutputVolumeSlider';
 import {
   localRouteDisplayName,
   rowSubtitle,
@@ -55,6 +56,10 @@ export function RouteRow({ route, onConnect, onDisconnect, subtitleOverride, the
     }
     if (needsPair && !pinExpanded) {
       setPinExpanded(true);
+      // The receiver only shows its PIN once a connect asks for it
+      // (/pair-pin-start), so start one unless an auth-required error says
+      // that already happened.
+      if (route.lastError !== 'cast_auth_required') onConnect(route.id, undefined);
       return;
     }
     onConnect(route.id, pinExpanded && pin.length > 0 ? pin : undefined);
@@ -109,6 +114,11 @@ export function RouteRow({ route, onConnect, onDisconnect, subtitleOverride, the
           )}
         </View>
       </Pressable>
+      {route.isActive && route.protocol !== 'local' && route.capabilities.supportsRemoteVolume && (
+        <View style={[styles.volumeRow, { backgroundColor: t.surface, borderBottomColor: t.border }]}>
+          <OutputVolumeSlider accent={t.accent} track={t.border} icon={t.textSubtle} />
+        </View>
+      )}
       {pinExpanded && !route.isActive && (
         <View style={[styles.pairRow, { backgroundColor: t.surface, borderBottomColor: t.border }]}>
           <TextInput
@@ -175,6 +185,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 10,
     gap: 8,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  volumeRow: {
+    paddingHorizontal: 16,
+    paddingVertical: 4,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   pinInput: {

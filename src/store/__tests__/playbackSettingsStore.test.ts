@@ -13,6 +13,7 @@ beforeEach(() => {
     downloadFormat: 'mp3',
     showSkipIntervalButtons: true,
     showSleepTimerButton: true,
+    showVolumeButton: false,
     skipBackwardInterval: 15,
     skipForwardInterval: 30,
     remoteControlMode: 'skip-track',
@@ -85,6 +86,12 @@ describe('playbackSettingsStore', () => {
   it('setShowSleepTimerButton updates flag', () => {
     playbackSettingsStore.getState().setShowSleepTimerButton(true);
     expect(playbackSettingsStore.getState().showSleepTimerButton).toBe(true);
+  });
+
+  it('volume button is off by default and toggles', () => {
+    expect(playbackSettingsStore.getState().showVolumeButton).toBe(false);
+    playbackSettingsStore.getState().setShowVolumeButton(true);
+    expect(playbackSettingsStore.getState().showVolumeButton).toBe(true);
   });
 
   it('setArtistPlayMode updates artist play mode', () => {

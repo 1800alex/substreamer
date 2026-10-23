@@ -17,6 +17,8 @@ import { FavoriteButton } from '@/components/FavoriteButton';
 import { MarqueeText } from '@/components/MarqueeText';
 import { MoreOptionsButton } from '@/components/MoreOptionsButton';
 import { PlaybackRateButton } from '@/components/PlaybackRateButton';
+import { VolumeButton } from '@/components/VolumeButton';
+import { playbackSettingsStore } from '@/store/playbackSettingsStore';
 import { PlayerProgressBar } from '@/components/PlayerProgressBar';
 import { QueueItemRow } from '@/components/QueueItemRow';
 import { RepeatButton } from '@/components/RepeatButton';
@@ -226,6 +228,7 @@ const PanelHeader = memo(function PanelHeader({
   const retrying = playerStore((s) => s.retrying);
 
   const { canSkipNext, canSkipPrevious } = useCanSkip();
+  const showVolumeButton = playbackSettingsStore((s) => s.showVolumeButton);
 
   const marqueeStyle = useMemo(
     () => [styles.trackTitle, { color: colors.textPrimary }],
@@ -306,8 +309,9 @@ const PanelHeader = memo(function PanelHeader({
 
           {/* Playback controls */}
           <View style={styles.controls}>
-            <View style={styles.controlSideLeft}>
+            <View style={[styles.controlSideLeft, styles.rateVolumeRow]}>
               <PlaybackRateButton />
+              {showVolumeButton && <VolumeButton />}
             </View>
 
             <View style={styles.transportControls}>
@@ -448,6 +452,11 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     paddingHorizontal: PADDING,
     marginBottom: 8,
+  },
+  rateVolumeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 20,
   },
   controlSideLeft: {
     flex: 1,

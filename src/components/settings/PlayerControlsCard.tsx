@@ -13,6 +13,8 @@ export function PlayerControlsCard() {
   const showSleepTimerButton = playbackSettingsStore((s) => s.showSleepTimerButton);
   const setShowSkipIntervalButtons = playbackSettingsStore((s) => s.setShowSkipIntervalButtons);
   const setShowSleepTimerButton = playbackSettingsStore((s) => s.setShowSleepTimerButton);
+  const showVolumeButton = playbackSettingsStore((s) => s.showVolumeButton);
+  const setShowVolumeButton = playbackSettingsStore((s) => s.setShowVolumeButton);
 
   return (
     <View style={settingsStyles.section}>
@@ -33,7 +35,7 @@ export function PlayerControlsCard() {
             trackColor={{ false: colors.border, true: colors.primary }}
           />
         </View>
-        <View style={styles.toggleRow}>
+        <View style={[styles.toggleRow, { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.border }]}>
           <View style={styles.textWrap}>
             <Text style={[styles.label, { color: colors.textPrimary }]}>
               {t('showSleepTimerButton')}
@@ -45,6 +47,21 @@ export function PlayerControlsCard() {
           <Switch
             value={showSleepTimerButton}
             onValueChange={setShowSleepTimerButton}
+            trackColor={{ false: colors.border, true: colors.primary }}
+          />
+        </View>
+        <View style={styles.toggleRow}>
+          <View style={styles.textWrap}>
+            <Text style={[styles.label, { color: colors.textPrimary }]}>
+              {t('showVolumeButton')}
+            </Text>
+            <Text style={[styles.hint, { color: colors.textSecondary }]}>
+              {t('showVolumeButtonHint')}
+            </Text>
+          </View>
+          <Switch
+            value={showVolumeButton}
+            onValueChange={setShowVolumeButton}
             trackColor={{ false: colors.border, true: colors.primary }}
           />
         </View>

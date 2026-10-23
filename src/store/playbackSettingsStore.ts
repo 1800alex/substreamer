@@ -156,6 +156,8 @@ export interface PlaybackSettingsState {
   showSkipIntervalButtons: boolean;
   /** Whether the sleep timer button appears on the player view. */
   showSleepTimerButton: boolean;
+  /** Whether the volume button appears on the player view. */
+  showVolumeButton: boolean;
   /** Backward skip interval in seconds. */
   skipBackwardInterval: SkipInterval;
   /** Forward skip interval in seconds. */
@@ -192,6 +194,7 @@ export interface PlaybackSettingsState {
   setDownloadFormat: (format: StreamFormat) => void;
   setShowSkipIntervalButtons: (show: boolean) => void;
   setShowSleepTimerButton: (show: boolean) => void;
+  setShowVolumeButton: (show: boolean) => void;
   setSkipBackwardInterval: (interval: SkipInterval) => void;
   setSkipForwardInterval: (interval: SkipInterval) => void;
   setRemoteControlMode: (mode: RemoteControlMode) => void;
@@ -237,6 +240,7 @@ export const playbackSettingsStore = create<PlaybackSettingsState>()(
       downloadFormat: 'mp3',
       showSkipIntervalButtons: true,
       showSleepTimerButton: true,
+      showVolumeButton: false,
       skipBackwardInterval: 15,
       skipForwardInterval: 30,
       remoteControlMode: 'skip-track',
@@ -258,6 +262,7 @@ export const playbackSettingsStore = create<PlaybackSettingsState>()(
       setDownloadFormat: (downloadFormat) => set({ downloadFormat: normalizeFormat(downloadFormat) }),
       setShowSkipIntervalButtons: (showSkipIntervalButtons) => set({ showSkipIntervalButtons }),
       setShowSleepTimerButton: (showSleepTimerButton) => set({ showSleepTimerButton }),
+      setShowVolumeButton: (showVolumeButton) => set({ showVolumeButton }),
       setSkipBackwardInterval: (skipBackwardInterval) => set({ skipBackwardInterval }),
       setSkipForwardInterval: (skipForwardInterval) => set({ skipForwardInterval }),
       setRemoteControlMode: (remoteControlMode) => set({ remoteControlMode }),
@@ -285,6 +290,7 @@ export const playbackSettingsStore = create<PlaybackSettingsState>()(
         downloadFormat: state.downloadFormat,
         showSkipIntervalButtons: state.showSkipIntervalButtons,
         showSleepTimerButton: state.showSleepTimerButton,
+        showVolumeButton: state.showVolumeButton,
         skipBackwardInterval: state.skipBackwardInterval,
         skipForwardInterval: state.skipForwardInterval,
         remoteControlMode: state.remoteControlMode,

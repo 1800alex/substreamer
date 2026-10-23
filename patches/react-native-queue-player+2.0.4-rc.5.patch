@@ -1,0 +1,474 @@
+diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.c b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.c
+index 80ad69b..364395f 100644
+--- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.c
++++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.c
+@@ -231,23 +231,38 @@ static int pair_setup_exchange(struct pair_setup_context *sctx,
+     size_t len;
+     ap2_rtsp_response_t resp;
+ 
+-    /* Step 1: request1 → response1 */
++    /* Step 1: request1 → response1.  request1 also seeds the SRP user with
++     * the credential, so it runs even when M2 was already fetched by
++     * ap2_pair_pin_start(); M1 itself carries no credential-dependent data. */
+     body = pair_setup_request1(&len, sctx);
+     if (!body) {
+         LOGE("pair_setup_request1 failed: %s", pair_setup_errmsg(sctx));
+         return -1;
+     }
+-    if (pair_post(session, endpoint, hkp_header, body, len, &resp) != 0) {
++    if (session->pending_m2) {
+         free(body);
+-        return -1;
+-    }
+-    free(body);
+-    if (pair_setup_response1(sctx, resp.body, resp.body_len) != 0) {
+-        LOGE("pair_setup_response1 failed: %s", pair_setup_errmsg(sctx));
++        LOGI("Using M2 fetched at pair-pin-start (%zu bytes)", session->pending_m2_len);
++        int ret = pair_setup_response1(sctx, session->pending_m2, session->pending_m2_len);
++        free(session->pending_m2);
++        session->pending_m2 = NULL;
++        session->pending_m2_len = 0;
++        if (ret != 0) {
++            LOGE("pair_setup_response1 failed: %s", pair_setup_errmsg(sctx));
++            return -1;
++        }
++    } else {
++        if (pair_post(session, endpoint, hkp_header, body, len, &resp) != 0) {
++            free(body);
++            return -1;
++        }
++        free(body);
++        if (pair_setup_response1(sctx, resp.body, resp.body_len) != 0) {
++            LOGE("pair_setup_response1 failed: %s", pair_setup_errmsg(sctx));
++            ap2_rtsp_response_free(&resp);
++            return -1;
++        }
+         ap2_rtsp_response_free(&resp);
+-        return -1;
+     }
+-    ap2_rtsp_response_free(&resp);
+ 
+     /* Step 2: request2 → response2 */
+     body = pair_setup_request2(&len, sctx);
+@@ -403,7 +418,38 @@ int ap2_pair_pin_start(ap2_session_t *session) {
+     int status = resp.status;
+     ap2_rtsp_response_free(&resp);
+     LOGI("pair-pin-start returned %d", status);
+-    return (status == 200) ? 0 : -1;
++    if (status != 200) return -1;
++
++    /* Send M1 now, as iOS and pyatv do, and keep M2 for ap2_pair_setup().
++     * The PIN is unknown here; M1 does not depend on it, so a throwaway
++     * context builds it. */
++    struct pair_setup_context *sctx =
++        pair_setup_new(PAIR_CLIENT_HOMEKIT_NORMAL, "0000", NULL, NULL,
++                       session->device_id);
++    if (!sctx) {
++        LOGE("pair_setup_new(NORMAL) failed");
++        return -1;
++    }
++    size_t len;
++    uint8_t *body = pair_setup_request1(&len, sctx);
++    pair_setup_free(sctx);
++    if (!body) return -1;
++    if (pair_post(session, "/pair-setup", "X-Apple-HKP: 3\r\n", body, len, &resp) != 0) {
++        free(body);
++        return -1;
++    }
++    free(body);
++    free(session->pending_m2);
++    session->pending_m2 = malloc(resp.body_len);
++    if (!session->pending_m2) {
++        ap2_rtsp_response_free(&resp);
++        return -1;
++    }
++    memcpy(session->pending_m2, resp.body, resp.body_len);
++    session->pending_m2_len = resp.body_len;
++    ap2_rtsp_response_free(&resp);
++    LOGI("pair-setup M1 sent with pin-start, M2 kept (%zu bytes)", session->pending_m2_len);
++    return 0;
+ }
+ 
+ int ap2_pair_setup(ap2_session_t *session, const char *pin, char **auth_key) {
+diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.h b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.h
+index bde5402..e39f8f4 100644
+--- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.h
++++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.h
+@@ -56,6 +56,10 @@ int ap2_pair_transient(ap2_session_t *session);
+  * Call this for PIN-based auth BEFORE ap2_pair_setup().
+  * Do NOT call this for password-based auth (password is known, not displayed).
+  *
++ * Also sends pair-setup M1 straight away and keeps the M2 reply in the
++ * session for ap2_pair_setup(). A Roku rejects the PIN it displayed when
++ * M1 arrives minutes after /pair-pin-start, i.e. after the user typed it.
++ *
+  * @return 0 on success, -1 on failure
+  */
+ int ap2_pair_pin_start(ap2_session_t *session);
+diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.c b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.c
+index 22b2514..87b80c2 100644
+--- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.c
++++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.c
+@@ -163,6 +163,9 @@ void ap2_session_destroy(ap2_session_t **pp) {
+     free(s->ring);
+     s->ring = NULL;
+ 
++    free(s->pending_m2);
++    s->pending_m2 = NULL;
++
+     /* Destroy mutexes. */
+     pthread_mutex_destroy(&s->ring_mutex);
+     pthread_mutex_destroy(&s->mutex);
+diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.h b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.h
+index f63ebfd..4624e14 100644
+--- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.h
++++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.h
+@@ -135,6 +135,12 @@ typedef struct ap2_session {
+     int password_required;  /* statusFlags bit 7              */
+     int auth_mode;          /* AP2_AUTH_* enum                */
+ 
++    /* pair-setup M2 (salt + server SRP key), fetched right after
++     * /pair-pin-start and replayed once the user supplies the PIN.
++     * Owned by the session; NULL when no PIN pairing is pending. */
++    uint8_t *pending_m2;
++    size_t pending_m2_len;
++
+     /* ---- HTTP Digest auth (for password-protected receivers) ---- */
+     char realm[128];
+     char nonce[256];
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt
+index 9d6e216..9f189d6 100644
+--- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt
+@@ -18,6 +18,7 @@ import com.margelo.nitro.queueplayer.cast.CastSinkRouter
+ import com.margelo.nitro.queueplayer.cast.PlaybackStateRouter
+ import com.margelo.nitro.queueplayer.cast.chromecast.ChromecastSession as RoutedChromecastSession
+ import com.margelo.nitro.queueplayer.cast.CastSession as RoutedCastSession
++import com.margelo.nitro.queueplayer.cast.airplay.AirPlayVolumeControl
+ import com.margelo.nitro.queueplayer.cast.airplay.AirPlay2JNI
+ import com.margelo.nitro.queueplayer.cast.airplay.AirPlayBackend
+ import com.margelo.nitro.queueplayer.cast.airplay.AirPlayReceiverMapper
+@@ -493,7 +494,7 @@ class CastManager : HybridCastManagerSpec() {
+    * is active or none has been reported yet. For Chromecast this is the device
+    * volume (`CastSession.volume`) observed via the session's `Cast.Listener` —
+    * the same plane `setRouteVolume` writes. AirPlay receivers don't report
+-   * current volume on the wire, so they return NaN.
++   * current volume on the wire, so AirPlay returns the last value sent.
+    */
+   override fun getRouteVolume(): Double {
+     val cc = activeChromecastSession.get()
+@@ -501,6 +502,7 @@ class CastManager : HybridCastManagerSpec() {
+       val v = cc.volume.value
+       if (!v.isNaN()) return v.toDouble()
+     }
++    (activeAirplaySession.get() as? AirPlayVolumeControl)?.let { return it.linearVolume.toDouble() }
+     return Double.NaN
+   }
+ 
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/PlaybackService.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/PlaybackService.kt
+index 52304d2..9bbf851 100644
+--- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/PlaybackService.kt
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/PlaybackService.kt
+@@ -32,12 +32,16 @@ import com.google.common.util.concurrent.ListenableFuture
+ import com.google.common.util.concurrent.MoreExecutors
+ import com.google.common.util.concurrent.SettableFuture
+ import com.margelo.nitro.core.Promise
++import com.margelo.nitro.queueplayer.cast.CastSinkRouter
+ import com.margelo.nitro.queueplayer.cast.PlaybackStateRouter
++import com.margelo.nitro.queueplayer.cast.airplay.AirPlayVolumeControl
++import com.margelo.nitro.queueplayer.cast.chromecast.CastVolumeForwardingPlayer
+ import java.util.UUID
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.cancel
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
++import kotlin.math.pow
+ 
+ /**
+  * Foreground service that owns the ExoPlayer + MediaLibrarySession.
+@@ -940,6 +944,8 @@ class PlaybackService : HeadlessJsMediaService() {
+       // (no role flip happened, leading is still leading).
+       newEngine.onCrossfadeCancel = { wrapper.onRoleSwapped() }
+       wrapper
++    } else if (newEngine is AirPlayEngine) {
++      airPlayVolumePlayer(newPlayer)
+     } else {
+       newPlayer
+     }
+@@ -975,6 +981,24 @@ class PlaybackService : HeadlessJsMediaService() {
+     return newEngine
+   }
+ 
++  /**
++   * Bind the AirPlay engine's player behind the same remote-volume wrapper
++   * Chromecast uses, so the hardware volume keys and lock-screen slider drive
++   * the receiver instead of the (irrelevant) local ExoPlayer volume. AirPlay's
++   * `-30..0` dB scale is already perceptual, so the wrapper's taper is undone
++   * at the boundary: each step is an even ~1 dB.
++   */
++  private fun airPlayVolumePlayer(player: Player): Player {
++    fun session() = CastSinkRouter.activeSession() as? AirPlayVolumeControl
++    val gamma = CastVolumeForwardingPlayer.GAMMA
++    return CastVolumeForwardingPlayer(
++      player = player,
++      routingControllerId = null,
++      setReceiverVolume = { session()?.setVolume(it.pow(1f / gamma)) },
++      receiverVolume = { session()?.linearVolume?.pow(gamma) ?: Float.NaN },
++    )
++  }
++
+   /**
+    * Observe the active Chromecast session and bind/unbind its CastPlayer
+    * onto the MediaSession. The collector runs on the main thread because
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlay2Session.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlay2Session.kt
+index 6b65300..541765a 100644
+--- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlay2Session.kt
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlay2Session.kt
+@@ -29,12 +29,15 @@ class AirPlay2Session(
+     private val handle: Long,
+     private val host: String,
+     private val port: Int,
+-) : CastSession.PcmStream(), MetadataAwareSession, MetadataSyncTarget {
++) : CastSession.PcmStream(), MetadataAwareSession, MetadataSyncTarget, AirPlayVolumeControl {
+ 
+     companion object {
+         private const val TAG = "AirPlay2Session"
+     }
+ 
++    @Volatile override var linearVolume: Float = AirPlayVolumeControl.CONNECT_VOLUME
++        private set
++
+     private val sink = AirPlay2Sink(handle)
+     @Volatile private var closed = false
+     // Swapped on the player's looper by onActivated, read and cleared on the
+@@ -53,7 +56,8 @@ class AirPlay2Session(
+ 
+     override fun setVolume(value: Float) {
+         if (closed) return
+-        AirPlay2JNI.nativeAp2SetVolume(handle, value)
++        linearVolume = value.coerceIn(0f, 1f)
++        AirPlay2JNI.nativeAp2SetVolume(handle, linearVolume)
+     }
+ 
+     override fun onActivated(player: Player, scope: CoroutineScope) {
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayBackend.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayBackend.kt
+index cbabf59..8beb143 100644
+--- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayBackend.kt
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayBackend.kt
+@@ -253,7 +253,7 @@ internal class AirPlayBackend(private val context: Context) : CastBackend {
+             AirplayJNI.CODEC_PCM,
+             FRAME_LENGTH,
+             LATENCY_FRAMES,
+-            AirplayJNI.CRYPTO_RSA, false,
++            AirPlayTxtParser.ap1Crypto(receiver.extras["et"]), false,
+             SAMPLE_RATE, SAMPLE_SIZE, CHANNELS,
+             DEFAULT_VOLUME_DB,
+         )
+@@ -574,19 +574,13 @@ internal class AirPlayBackend(private val context: Context) : CastBackend {
+         // Default RTSP port for AirPlay receivers.
+         const val DEFAULT_RTSP_PORT = 5000
+ 
+-        // libraop volume scale: -30 dB silent, 0 dB max. Connect at a low,
+-        // safe level (0.30 linear → -21 dB) so a fresh AirPlay 1 connection
+-        // is audible but never blasts the receiver; the user / hardware
+-        // volume buttons adjust up afterward. The volume command IS still
+-        // sent on connect (receivers need it for correct audio decode) — just
+-        // sent quiet, not at max. (Receivers map this dB to their own 0-100
+-        // display via a non-linear curve — some floor the low end — so the
+-        // displayed % varies per device.)
+-        const val DEFAULT_VOLUME_DB = -21f
+-
+-        // AP2 uses 0.0–1.0 linear scale (0=mute, 1=full). Connect at 0.30
+-        // (the native maps this to -21 dB) for the same reason as
+-        // DEFAULT_VOLUME_DB above: audible but never blast on connect.
+-        const val AP2_CONNECT_VOLUME = 0.30f
++        // libraop volume scale: -30 dB silent, 0 dB max. The volume command
++        // IS sent on connect (receivers need it for correct audio decode).
++        // AirPlayVolumeControl.CONNECT_VOLUME explains the level; the phone's
++        // volume keys adjust it afterwards.
++        val DEFAULT_VOLUME_DB = AirPlayVolumeControl.toDb(AirPlayVolumeControl.CONNECT_VOLUME)
++
++        // AP2 uses 0.0–1.0 linear scale (0=mute, 1=full); same connect level.
++        const val AP2_CONNECT_VOLUME = AirPlayVolumeControl.CONNECT_VOLUME
+     }
+ }
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayDiscovery.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayDiscovery.kt
+index 2a3a909..4d15e52 100644
+--- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayDiscovery.kt
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayDiscovery.kt
+@@ -460,6 +460,7 @@ internal class AirPlayDiscovery(private val context: Context) {
+         parsed.deviceId?.let { extras["deviceid"] = it }
+         parsed.serverVersion?.let { extras["serverVersion"] = it }
+         parsed.modelString?.let { extras["model"] = it }
++        parsed.encryptionTypes?.let { extras["et"] = it }
+         // host can be null on some Android versions if the service was
+         // resolved over IPv4 only — guard before reading. The
+         // `NsdServiceInfo.host` getter is deprecated on API 34+ in
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlaySession.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlaySession.kt
+index 3d3421c..afaa0a9 100644
+--- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlaySession.kt
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlaySession.kt
+@@ -26,7 +26,7 @@ class AirPlaySession(
+     private val handle: Long,
+     private val host: String,
+     private val port: Int,
+-) : CastSession.PcmStream(), MetadataAwareSession, MetadataSyncTarget {
++) : CastSession.PcmStream(), MetadataAwareSession, MetadataSyncTarget, AirPlayVolumeControl {
+ 
+     companion object {
+         private const val TAG = "AirPlaySession"
+@@ -43,14 +43,16 @@ class AirPlaySession(
+     // read a stale null and leave the previous sync running.
+     private val metadataSync = AtomicReference<AirPlayMetadataSync?>()
+ 
++    @Volatile override var linearVolume: Float = AirPlayVolumeControl.CONNECT_VOLUME
++        private set
++
+     override fun audioSink(): AudioSink = sink
+ 
+     override fun setVolume(value: Float) {
+         if (closed) return
+-        // libraop volume is in dB: -30 (silent) to 0 (max).
+-        // Map 0.0..1.0 → -30..0 linearly.
+-        val dbVolume = -30f + (value.coerceIn(0f, 1f) * 30f)
+-        AirplayJNI.nativeSetVolume(handle, dbVolume)
++        // libraop volume is in dB: -30..0, -144 = mute.
++        linearVolume = value.coerceIn(0f, 1f)
++        AirplayJNI.nativeSetVolume(handle, AirPlayVolumeControl.toDb(linearVolume))
+     }
+ 
+     override fun onActivated(player: Player, scope: CoroutineScope) {
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayTxtParser.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayTxtParser.kt
+index cbfee86..1d20fb5 100644
+--- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayTxtParser.kt
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayTxtParser.kt
+@@ -20,6 +20,9 @@ package com.margelo.nitro.queueplayer.cast.airplay
+  *     and we surface `extras["supportsAirPlay2"] = "true"`.
+  *   - **bit 19** — pairing required (HomePod, modern Apple TVs). When
+  *     set, `Receiver.capabilities.requiresPairing = true`.
++ * - `et=` — comma-separated RAOP encryption types the receiver accepts
++ *   (`0` none, `1` RSA/AES, `3`/`4`/`5` FairPlay variants). Drives the
++ *   AirPlay 1 crypto choice via [ap1Crypto].
+  * - `deviceid=` — MAC-address-shaped stable identifier
+  *   (e.g. `"AA:BB:CC:DD:EE:FF"`). Used by `AirPlayDiscovery` to dedupe
+  *   the same physical receiver across `_raop._tcp.` and `_airplay._tcp.`
+@@ -51,6 +54,7 @@ internal object AirPlayTxtParser {
+      * @property modelString The `am=` or `model=` value verbatim, used
+      *   for [com.margelo.nitro.queueplayer.cast.Receiver.extras] under
+      *   the `"model"` key.
++     * @property encryptionTypes The `et=` value verbatim, or `null`.
+      */
+     data class Parsed(
+         val deviceId: String?,
+@@ -59,6 +63,7 @@ internal object AirPlayTxtParser {
+         val supportsAirPlay2: Boolean,
+         val serverVersion: String?,
+         val modelString: String?,
++        val encryptionTypes: String? = null,
+     )
+ 
+     /**
+@@ -91,9 +96,23 @@ internal object AirPlayTxtParser {
+             supportsAirPlay2 = supportsAirPlay2,
+             serverVersion = vs,
+             modelString = am ?: model,
++            encryptionTypes = lookupCaseInsensitive(attrs, "et"),
+         )
+     }
+ 
++    /**
++     * AirPlay 1 crypto for a receiver's `et=` value: clear when it accepts
++     * `0`, RSA/AES only when it lists `1` without `0`. Receivers that omit
++     * `et=` keep the RSA default. A receiver that does not list `1` cannot
++     * decrypt RSA/AES and plays the ciphertext as white noise (Pioneer
++     * VSX-1123 advertises `et=0,4`).
++     */
++    fun ap1Crypto(encryptionTypes: String?): Int {
++        val types = encryptionTypes?.split(",")?.map { it.trim() }?.toSet()
++            ?: return AirplayJNI.CRYPTO_RSA
++        return if ("0" in types || "1" !in types) AirplayJNI.CRYPTO_CLEAR else AirplayJNI.CRYPTO_RSA
++    }
++
+     /**
+      * Map an AirPlay model string to one of the documented device-class
+      * strings. The first lower-case token (`"AudioAccessory"`,
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayVolumeControl.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayVolumeControl.kt
+new file mode 100644
+index 0000000..fad2ca0
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayVolumeControl.kt
+@@ -0,0 +1,29 @@
++package com.margelo.nitro.queueplayer.cast.airplay
++
++/**
++ * An AirPlay session whose receiver volume the phone's hardware volume keys
++ * drive. AirPlay receivers never report their volume back, so the session
++ * remembers the last value it sent.
++ */
++interface AirPlayVolumeControl {
++  /** Last volume sent to the receiver: linear `0.0..1.0` over its `-30..0` dB scale. */
++  val linearVolume: Float
++
++  fun setVolume(value: Float)
++
++  companion object {
++    /**
++     * Volume a fresh connection starts at: -10 dB on the AirPlay scale.
++     * Audible on software-volume receivers such as shairport-sync, which map
++     * the AirPlay scale onto a much wider attenuation, yet below full scale for
++     * receivers that tie AirPlay volume to their master volume.
++     */
++    const val CONNECT_VOLUME = 2f / 3f
++
++    /** Linear `0.0..1.0` to AirPlay dB: `-30..0`, with `0` muted (`-144`). */
++    fun toDb(value: Float): Float {
++      val v = value.coerceIn(0f, 1f)
++      return if (v == 0f) -144f else -30f + v * 30f
++    }
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayAp1CryptoTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayAp1CryptoTest.kt
+new file mode 100644
+index 0000000..0fbb71b
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayAp1CryptoTest.kt
+@@ -0,0 +1,39 @@
++package com.margelo.nitro.queueplayer.cast.airplay
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++/**
++ * AirPlay 1 crypto follows the receiver's `et=` TXT record. Sending RSA/AES
++ * to a receiver that does not list `1` makes it play the ciphertext as white
++ * noise, so clear is used whenever the receiver accepts it.
++ */
++class AirPlayAp1CryptoTest {
++
++  @Test
++  fun `receiver without RSA support gets clear audio`() {
++    // Pioneer VSX-1123 advertises et=0,4 (none or FairPlay).
++    assertEquals(AirplayJNI.CRYPTO_CLEAR, AirPlayTxtParser.ap1Crypto("0,4"))
++  }
++
++  @Test
++  fun `receiver accepting clear and RSA gets clear audio`() {
++    // shairport-sync classic advertises et=0,1.
++    assertEquals(AirplayJNI.CRYPTO_CLEAR, AirPlayTxtParser.ap1Crypto("0,1"))
++  }
++
++  @Test
++  fun `RSA-only receiver keeps RSA`() {
++    assertEquals(AirplayJNI.CRYPTO_RSA, AirPlayTxtParser.ap1Crypto("1"))
++  }
++
++  @Test
++  fun `missing et keeps the RSA default`() {
++    assertEquals(AirplayJNI.CRYPTO_RSA, AirPlayTxtParser.ap1Crypto(null))
++  }
++
++  @Test
++  fun `et is read from the TXT record`() {
++    assertEquals("0,4", AirPlayTxtParser.parse(mapOf("et" to "0,4")).encryptionTypes)
++  }
++}

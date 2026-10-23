@@ -127,6 +127,11 @@ jest.mock('@/components/PlaybackRateButton', () => {
   return { PlaybackRateButton: () => <View testID="rate-button" /> };
 });
 
+jest.mock('@/components/VolumeButton', () => {
+  const { View } = require('react-native');
+  return { VolumeButton: () => <View testID="volume-button" /> };
+});
+
 jest.mock('@/components/PlayerProgressBar', () => {
   const { View } = require('react-native');
   return { PlayerProgressBar: () => <View testID="progress-bar" /> };
@@ -234,6 +239,7 @@ import { type SharedValue } from 'react-native-reanimated';
 
 import { appStateStore } from '@/store/appStateStore';
 import { lyricsStore } from '@/store/lyricsStore';
+import { playbackSettingsStore } from '@/store/playbackSettingsStore';
 import { playerStore } from '@/store/playerStore';
 import { tabletLayoutStore } from '@/store/tabletLayoutStore';
 import { type Child } from '@/services/subsonicService';
@@ -315,5 +321,23 @@ describe('PlayerTabletLandscape lyrics gate', () => {
     render(<PlayerTabletLandscape expandProgress={expandProgress} />);
 
     expect(fetchLyrics).not.toHaveBeenCalled();
+  });
+});
+
+describe('PlayerTabletLandscape volume button', () => {
+  afterEach(() => playbackSettingsStore.setState({ showVolumeButton: false }));
+
+  it('is absent by default', () => {
+    const { queryByTestId } = render(<PlayerTabletLandscape expandProgress={expandProgress} />);
+    expect(queryByTestId('volume-button')).toBeNull();
+    expect(queryByTestId('secondary-controls-grid')).toBeNull();
+  });
+
+  it('switches the secondary row to the even grid when enabled', () => {
+    playbackSettingsStore.setState({ showVolumeButton: true });
+    const { getByTestId } = render(<PlayerTabletLandscape expandProgress={expandProgress} />);
+    expect(getByTestId('secondary-controls-grid')).toBeTruthy();
+    expect(getByTestId('volume-button')).toBeTruthy();
+    expect(getByTestId('rate-button')).toBeTruthy();
   });
 });
