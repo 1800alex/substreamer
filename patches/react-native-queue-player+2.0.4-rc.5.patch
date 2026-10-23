@@ -1,5 +1,334 @@
+diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/CMakeLists.txt b/node_modules/react-native-queue-player/android/src/main/cpp/CMakeLists.txt
+index 48ee93d..6ce3b13 100644
+--- a/node_modules/react-native-queue-player/android/src/main/cpp/CMakeLists.txt
++++ b/node_modules/react-native-queue-player/android/src/main/cpp/CMakeLists.txt
+@@ -166,6 +166,7 @@ add_library(airplay2 SHARED
+     airplay2_pair.c
+     # Session control (SETUP, RECORD, volume)
+     airplay2_control.c
++    airplay2_events.c
+     # Audio pipeline (drain thread, ALAC encode, encrypt, RTP send)
+     airplay2_audio.c
+     # PTP master clock (timing sync for receiver)
+diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_audio.c b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_audio.c
+index 82880fe..3178897 100644
+--- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_audio.c
++++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_audio.c
+@@ -247,9 +247,10 @@ static int send_sync_ntp(ap2_session_t *s, int is_first) {
+     pkt[2] = 0x00;
+     pkt[3] = 0x07;
+ 
+-    /* Current RTP position. */
+-    uint32_t cur_pos_be = htonl(s->rtp_timestamp);
+-    memcpy(pkt + 4, &cur_pos_be, 4);
++    /* Bytes 4..7: RTP time playing now (next packet minus latency); bytes
++     * 16..19: next packet's RTP time — libraop's rtp_sync_pkt_t order. */
++    uint32_t playing_be = htonl(s->rtp_timestamp - RTCP_SYNC_LATENCY);
++    memcpy(pkt + 4, &playing_be, 4);
+ 
+     /* NTP timestamp: CLOCK_MONOTONIC + epoch delta. */
+     struct timespec wall;
+@@ -259,9 +260,8 @@ static int send_sync_ntp(ap2_session_t *s, int is_first) {
+     memcpy(pkt + 8, &ntp_sec, 4);
+     memcpy(pkt + 12, &ntp_frac, 4);
+ 
+-    /* RTP start time — must match the value communicated in SETUP. */
+-    uint32_t rtptime_be = htonl(s->rtp_timestamp - RTCP_SYNC_LATENCY);
+-    memcpy(pkt + 16, &rtptime_be, 4);
++    uint32_t next_be = htonl(s->rtp_timestamp);
++    memcpy(pkt + 16, &next_be, 4);
+ 
+     struct sockaddr_in ctl_addr;
+     memset(&ctl_addr, 0, sizeof(ctl_addr));
+@@ -344,12 +344,13 @@ static void *drain_thread_fn(void *arg) {
+             continue;
+         }
+ 
+-        /* ALAC encode. */
+-        uint8_t *alac_out = NULL;
+-        int alac_size = 0;
+-        if (!pcm_to_alac(s->alac, pcm_buf, s->spf, &alac_out, &alac_size)) {
+-            LOGE("ALAC encode failed");
+-            continue;
++        /* The stream is negotiated as PCM (ct=1): big-endian 16-bit samples. */
++        uint8_t *alac_out = pcm_buf;
++        int alac_size = (int)chunk_bytes;
++        for (size_t i = 0; i + 1 < chunk_bytes; i += 2) {
++            uint8_t lo = pcm_buf[i];
++            pcm_buf[i] = pcm_buf[i + 1];
++            pcm_buf[i + 1] = lo;
+         }
+ 
+         /* Send initial sync packet before first audio packet. */
+@@ -394,14 +395,12 @@ static void *drain_thread_fn(void *arg) {
+                         s->session_dead = 1;
+                         ap2_notify_session_died(s, 1 /* FEEDBACK_TIMEOUT */);
+                         s->drain_running = -1;
+-                        free(alac_out);
+                         break;
+                     }
+                 }
+                 s->feedback_counter = 0;
+             }
+         }
+-        free(alac_out);
+ 
+         /* Pace: wait until next_send time. */
+         next_send.tv_nsec += chunk_ns;
+diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_control.c b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_control.c
+index 7fa6273..6c4a44b 100644
+--- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_control.c
++++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_control.c
+@@ -8,6 +8,7 @@
+ #include "airplay2_ptp.h"
+ #include "airplay2_ntp.h"
+ #include "airplay2_dmap.h"
++#include "airplay2_events.h"
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -239,6 +240,10 @@ int ap2_setup_session(ap2_session_t *session) {
+         return -1;
+     }
+     session->event_fd = efd;
++    if (ap2_events_start(session) != 0) {
++        LOGE("Event channel start failed");
++        return -1;
++    }
+ 
+     session->state = AP2_STATE_SETUP_SESSION;
+     LOGI("SETUP session ok: eventPort=%d", session->event_port);
+@@ -296,8 +301,8 @@ int ap2_setup_stream(ap2_session_t *session) {
+     uint8_t *plist_buf = NULL;
+     size_t plist_len = 0;
+     if (ap2_plist_build_setup_stream(
+-            0x40000,             /* audioFormat: ALAC/44100/16/2 */
+-            2,                   /* ct: ALAC */
++            0x800,               /* audioFormat: PCM/44100/16/2 */
++            1,                   /* ct: PCM (big-endian samples) */
+             session->sample_rate,
+             session->spf,
+             session->audio_key,  /* shk */
+diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_events.c b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_events.c
+new file mode 100644
+index 0000000..0603dc7
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_events.c
+@@ -0,0 +1,159 @@
++/**
++ * AirPlay 2 event channel — see airplay2_events.h.
++ *
++ * Records are [2-byte LE length][ChaCha20-Poly1305 ciphertext][16-byte tag],
++ * at most 1024 payload bytes, AAD = the length bytes, nonce = a per-direction
++ * 64-bit LE counter in bytes 4..11. Requests are HTTP-style; each gets an
++ * empty 200 with the request's CSeq.
++ */
++#include "airplay2_events.h"
++#include "airplay2_crypto.h"
++
++#include <errno.h>
++#include <poll.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#define TAG "AP2Events"
++#include "airplay2_filelog.h"
++
++#define RECORD_MAX 1024
++#define PENDING_MAX (64 * 1024)
++
++static void make_nonce(uint8_t nonce[12], uint64_t counter) {
++    memset(nonce, 0, 12);
++    memcpy(nonce + 4, &counter, 8);
++}
++
++static int read_full(int fd, uint8_t *buf, size_t len) {
++    size_t got = 0;
++    while (got < len) {
++        ssize_t n = recv(fd, buf + got, len - got, 0);
++        if (n <= 0) return -1;
++        got += (size_t)n;
++    }
++    return 0;
++}
++
++static int send_record(ap2_session_t *s, const uint8_t *data, size_t len) {
++    while (len > 0) {
++        size_t chunk = len > RECORD_MAX ? RECORD_MAX : len;
++        uint8_t aad[2] = { (uint8_t)(chunk & 0xff), (uint8_t)(chunk >> 8) };
++        uint8_t nonce[12], tag[16], cipher[RECORD_MAX];
++        make_nonce(nonce, s->event_write_nonce++);
++        if (ap2_chacha20_encrypt(s->event_write_key, nonce, aad, 2,
++                                 data, chunk, cipher, tag) != 0)
++            return -1;
++        if (send(s->event_fd, aad, 2, 0) != 2 ||
++            send(s->event_fd, cipher, chunk, 0) != (ssize_t)chunk ||
++            send(s->event_fd, tag, 16, 0) != 16)
++            return -1;
++        data += chunk;
++        len -= chunk;
++    }
++    return 0;
++}
++
++/* Read one record and append its plaintext to pending. */
++static int read_record(ap2_session_t *s, uint8_t *pending, size_t *pending_len) {
++    uint8_t aad[2], tag[16], cipher[RECORD_MAX], nonce[12];
++    if (read_full(s->event_fd, aad, 2) != 0) return -1;
++    size_t len = aad[0] | ((size_t)aad[1] << 8);
++    if (len > RECORD_MAX || *pending_len + len > PENDING_MAX) return -1;
++    if (read_full(s->event_fd, cipher, len) != 0 ||
++        read_full(s->event_fd, tag, 16) != 0)
++        return -1;
++    make_nonce(nonce, s->event_read_nonce++);
++    if (ap2_chacha20_decrypt(s->event_read_key, nonce, aad, 2,
++                             cipher, len, tag, pending + *pending_len) != 0) {
++        LOGE("event record failed to decrypt");
++        return -1;
++    }
++    *pending_len += len;
++    return 0;
++}
++
++static const char *find_header(const char *head, const char *name) {
++    size_t n = strlen(name);
++    for (const char *line = head; line && *line; ) {
++        if (strncasecmp(line, name, n) == 0 && line[n] == ':') return line + n + 1;
++        line = strstr(line, "\r\n");
++        if (line) line += 2;
++    }
++    return NULL;
++}
++
++/* Acknowledge every complete request in pending; keep any partial tail. */
++static int answer_requests(ap2_session_t *s, uint8_t *pending, size_t *pending_len) {
++    for (;;) {
++        uint8_t *end = memmem(pending, *pending_len, "\r\n\r\n", 4);
++        if (!end) return *pending_len >= 8192 ? -1 : 0;
++        size_t head_len = (size_t)(end - pending) + 4;
++        char head[8192];
++        memcpy(head, pending, head_len);
++        head[head_len] = '\0';
++        const char *cl = find_header(head, "Content-Length");
++        size_t body = cl ? strtoul(cl, NULL, 10) : 0;
++        if (body > PENDING_MAX || *pending_len < head_len + body) return 0;
++        const char *cseq = find_header(head, "CSeq");
++        unsigned long seq = cseq ? strtoul(cseq, NULL, 10) : 0;
++        char reply[96];
++        int n = snprintf(reply, sizeof(reply),
++                         "HTTP/1.1 200 OK\r\nCSeq: %lu\r\nContent-Length: 0\r\n\r\n", seq);
++        LOGD("event request (CSeq %lu, %zu body bytes) acknowledged", seq, body);
++        if (send_record(s, (const uint8_t *)reply, (size_t)n) != 0) return -1;
++        memmove(pending, pending + head_len + body, *pending_len - head_len - body);
++        *pending_len -= head_len + body;
++    }
++}
++
++static void *event_thread(void *arg) {
++    ap2_session_t *s = (ap2_session_t *)arg;
++    uint8_t *pending = (uint8_t *)malloc(PENDING_MAX);
++    size_t pending_len = 0;
++    if (!pending) return NULL;
++    LOGI("Event channel serviced on fd=%d", s->event_fd);
++    while (s->event_running) {
++        struct pollfd p = { .fd = s->event_fd, .events = POLLIN };
++        int r = poll(&p, 1, 200);
++        if (r == 0) continue;
++        if (r < 0 || (p.revents & (POLLERR | POLLHUP | POLLNVAL)) ||
++            read_record(s, pending, &pending_len) != 0 ||
++            answer_requests(s, pending, &pending_len) != 0) {
++            if (s->event_running) LOGE("Event channel closed");
++            break;
++        }
++    }
++    free(pending);
++    return NULL;
++}
++
++int ap2_events_start(ap2_session_t *s) {
++    if (s->event_fd < 0 || s->event_running) return 0;
++    size_t len = s->shared_secret_len ? s->shared_secret_len : 32;
++    /* Key names are the receiver's view: we write with its read key. */
++    if (ap2_hkdf_sha512(s->shared_secret, len, "Events-Salt",
++                        "Events-Read-Encryption-Key", s->event_write_key, 32) != 0 ||
++        ap2_hkdf_sha512(s->shared_secret, len, "Events-Salt",
++                        "Events-Write-Encryption-Key", s->event_read_key, 32) != 0)
++        return -1;
++    s->event_write_nonce = 0;
++    s->event_read_nonce = 0;
++    s->event_running = 1;
++    if (pthread_create(&s->event_thread, NULL, event_thread, s) != 0) {
++        s->event_running = 0;
++        return -1;
++    }
++    return 0;
++}
++
++void ap2_events_stop(ap2_session_t *s) {
++    if (!s->event_running) return;
++    s->event_running = 0;
++    if (s->event_fd >= 0) shutdown(s->event_fd, SHUT_RDWR);
++    pthread_join(s->event_thread, NULL);
++}
+diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_events.h b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_events.h
+new file mode 100644
+index 0000000..325433c
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_events.h
+@@ -0,0 +1,27 @@
++/**
++ * AirPlay 2 event channel: the TCP connection to the receiver's eventPort.
++ *
++ * Traffic is HAP-encrypted with keys derived from the pairing secret
++ * ("Events-Salt"). The receiver sends requests on it and expects each to be
++ * acknowledged; a Roku streams silently while they go unanswered.
++ */
++#ifndef AIRPLAY2_EVENTS_H
++#define AIRPLAY2_EVENTS_H
++
++#include "airplay2_session.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/** Derive the event keys and start answering requests on session->event_fd. */
++int ap2_events_start(ap2_session_t *session);
++
++/** Stop the event thread. Idempotent; call before closing event_fd. */
++void ap2_events_stop(ap2_session_t *session);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* AIRPLAY2_EVENTS_H */
+diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_jni.cpp b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_jni.cpp
+index 64ecc50..c2d83dd 100644
+--- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_jni.cpp
++++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_jni.cpp
+@@ -17,6 +17,7 @@ extern "C" {
+ #include "airplay2_pair.h"
+ #include "airplay2_control.h"
+ #include "airplay2_audio.h"
++#include "airplay2_events.h"
+ #include "airplay2_filelog.h"
+ }
+ 
+@@ -186,6 +187,7 @@ static void nativeAp2Disconnect(JNIEnv *, jclass, jlong handle) {
+     ap2_rtsp_close(s);
+     if (s->data_fd >= 0)    { close(s->data_fd);    s->data_fd = -1; }
+     if (s->control_fd >= 0) { close(s->control_fd); s->control_fd = -1; }
++    ap2_events_stop(s);
+     if (s->event_fd >= 0)   { close(s->event_fd);   s->event_fd = -1; }
+ 
+     s->state = AP2_STATE_INIT;
 diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.c b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.c
-index 80ad69b..364395f 100644
+index 80ad69b..5da06de 100644
 --- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.c
 +++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.c
 @@ -231,23 +231,38 @@ static int pair_setup_exchange(struct pair_setup_context *sctx,
@@ -50,7 +379,15 @@ index 80ad69b..364395f 100644
  
      /* Step 2: request2 → response2 */
      body = pair_setup_request2(&len, sctx);
-@@ -403,7 +418,38 @@ int ap2_pair_pin_start(ap2_session_t *session) {
+@@ -368,6 +383,7 @@ int ap2_pair_transient(ap2_session_t *session) {
+     /* For transient: shared_secret_len = 64. */
+     size_t ss_len = result->shared_secret_len > 64 ? 64 : result->shared_secret_len;
+     memcpy(session->shared_secret, result->shared_secret, ss_len);
++    session->shared_secret_len = ss_len;
+     LOGI("Stored shared_secret: %zu bytes (transient)", ss_len);
+ 
+     /* Derive control-channel encryption keys. */
+@@ -403,7 +419,38 @@ int ap2_pair_pin_start(ap2_session_t *session) {
      int status = resp.status;
      ap2_rtsp_response_free(&resp);
      LOGI("pair-pin-start returned %d", status);
@@ -90,6 +427,14 @@ index 80ad69b..364395f 100644
  }
  
  int ap2_pair_setup(ap2_session_t *session, const char *pin, char **auth_key) {
+@@ -499,6 +546,7 @@ int ap2_pair_verify(ap2_session_t *session) {
+ 
+     /* Store X25519 shared secret for audio encryption (shk). */
+     memcpy(session->shared_secret, result->shared_secret, 32);
++    session->shared_secret_len = 32;
+     LOGI("Stored shared_secret: 32 bytes from pair-verify");
+ 
+     /* Derive control channel keys. */
 diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.h b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.h
 index bde5402..e39f8f4 100644
 --- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_pair.h
@@ -106,10 +451,26 @@ index bde5402..e39f8f4 100644
   */
  int ap2_pair_pin_start(ap2_session_t *session);
 diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.c b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.c
-index 22b2514..87b80c2 100644
+index 22b2514..930c126 100644
 --- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.c
 +++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.c
-@@ -163,6 +163,9 @@ void ap2_session_destroy(ap2_session_t **pp) {
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include "airplay2_session.h"
++#include "airplay2_events.h"
+ #include "airplay2_filelog.h"
+ 
+ /* File-logging globals — single definition, declared extern in airplay2_filelog.h. */
+@@ -151,6 +152,7 @@ void ap2_session_destroy(ap2_session_t **pp) {
+     close_fd(&s->rtsp_fd);
+     close_fd(&s->data_fd);
+     close_fd(&s->control_fd);
++    ap2_events_stop(s);
+     close_fd(&s->event_fd);
+     /* PTP may share one socket (ClockPorts mode). Avoid double-close. */
+     if (s->ptp_general_fd == s->ptp_event_fd)
+@@ -163,6 +165,9 @@ void ap2_session_destroy(ap2_session_t **pp) {
      free(s->ring);
      s->ring = NULL;
  
@@ -120,10 +481,31 @@ index 22b2514..87b80c2 100644
      pthread_mutex_destroy(&s->ring_mutex);
      pthread_mutex_destroy(&s->mutex);
 diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.h b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.h
-index f63ebfd..4624e14 100644
+index f63ebfd..b313761 100644
 --- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.h
 +++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay2_session.h
-@@ -135,6 +135,12 @@ typedef struct ap2_session {
+@@ -51,6 +51,12 @@ typedef struct ap2_session {
+     int data_fd;            /* Audio UDP socket (realtime)    */
+     int control_fd;         /* RTCP UDP socket (control)      */
+     int event_fd;           /* Event channel TCP socket       */
++    uint8_t event_write_key[32];
++    uint8_t event_read_key[32];
++    uint64_t event_write_nonce;
++    uint64_t event_read_nonce;
++    pthread_t event_thread;
++    volatile int event_running;
+     int ptp_event_fd;       /* PTP UDP socket (port 319)      */
+     int ptp_general_fd;     /* PTP UDP socket (port 320)      */
+     char host[256];
+@@ -66,6 +72,7 @@ typedef struct ap2_session {
+ 
+     /* ---- Crypto keys (per-session) ---- */
+     uint8_t shared_secret[64];
++    size_t shared_secret_len;
+     uint8_t write_key[32];  /* Control channel encrypt key    */
+     uint8_t read_key[32];   /* Control channel decrypt key    */
+     uint8_t audio_key[32];  /* shk for audio encryption       */
+@@ -135,6 +142,12 @@ typedef struct ap2_session {
      int password_required;  /* statusFlags bit 7              */
      int auth_mode;          /* AP2_AUTH_* enum                */
  
@@ -136,6 +518,131 @@ index f63ebfd..4624e14 100644
      /* ---- HTTP Digest auth (for password-protected receivers) ---- */
      char realm[128];
      char nonce[256];
+diff --git a/node_modules/react-native-queue-player/android/src/main/cpp/airplay_jni.cpp b/node_modules/react-native-queue-player/android/src/main/cpp/airplay_jni.cpp
+index 81f8a83..4212a0c 100644
+--- a/node_modules/react-native-queue-player/android/src/main/cpp/airplay_jni.cpp
++++ b/node_modules/react-native-queue-player/android/src/main/cpp/airplay_jni.cpp
+@@ -46,6 +46,10 @@ struct JniSession {
+     size_t  read_pos;    // monotonically increasing
+     pthread_mutex_t mutex;
+ 
++    // libraop's RTSP client is not thread-safe; volume, metadata, keepalive
++    // and the drain thread's re-anchor FLUSH all go through it.
++    pthread_mutex_t rtsp_mutex;
++
+     size_t available() const { return write_pos - read_pos; }
+     size_t free_space() const { return RING_SIZE - available(); }
+ 
+@@ -80,10 +84,12 @@ struct JniSession {
+                    thread{} {
+         memset(ring, 0, sizeof(ring));
+         pthread_mutex_init(&mutex, nullptr);
++        pthread_mutex_init(&rtsp_mutex, nullptr);
+     }
+ 
+     ~JniSession() {
+         pthread_mutex_destroy(&mutex);
++        pthread_mutex_destroy(&rtsp_mutex);
+     }
+ };
+ 
+@@ -100,6 +106,11 @@ static void *drain_thread_func(void *arg) {
+     uint8_t chunk[JniSession::CHUNK_BYTES];
+     int accept_spins = 0;
+     int drain_cycles = 0;
++    // libraop keeps its RTP clock running while the ring is empty; data that
++    // arrives after a stall (pause, buffering, engine swap) would be sent in a
++    // catch-up burst the receiver drops as late. Re-anchor at "now" instead.
++    static constexpr int STALL_MS = 500;
++    int starved_ms = 0;
+ 
+     while (s->drain_running) {
+         // Phase 1: Wait for enough data in the ring buffer
+@@ -108,12 +119,23 @@ static void *drain_thread_func(void *arg) {
+         if (avail < JniSession::CHUNK_BYTES) {
+             pthread_mutex_unlock(&s->mutex);
+             usleep(2000);  // 2ms — wait for producer
++            if (s->chunks_sent.load(std::memory_order_relaxed) > 0) starved_ms += 2;
+             continue;
+         }
+         // Dequeue one chunk
+         s->ring_read(chunk, JniSession::CHUNK_BYTES);
+         pthread_mutex_unlock(&s->mutex);
+ 
++        if (starved_ms >= STALL_MS) {
++            __android_log_print(ANDROID_LOG_INFO, DRAIN_TAG,
++                "Stream stalled %d ms, re-anchoring RTP timing", starved_ms);
++            pthread_mutex_lock(&s->rtsp_mutex);
++            raopcl_stop(s->raop);
++            raopcl_flush(s->raop);
++            pthread_mutex_unlock(&s->rtsp_mutex);
++        }
++        starved_ms = 0;
++
+         // Phase 2: Wait for libraop to accept (pacing)
+         accept_spins = 0;
+         while (s->drain_running && !raopcl_accept_frames(s->raop)) {
+@@ -170,6 +192,13 @@ static struct raopcl_s *toRaop(jlong handle) {
+     return js ? js->raop : nullptr;
+ }
+ 
++/** Holds the session's RTSP lock for the scope. */
++struct RtspLock {
++    JniSession *s;
++    explicit RtspLock(jlong handle) : s(toJni(handle)) { if (s) pthread_mutex_lock(&s->rtsp_mutex); }
++    ~RtspLock() { if (s) pthread_mutex_unlock(&s->rtsp_mutex); }
++};
++
+ // ---------------------------------------------------------------------------
+ // JNI methods
+ // ---------------------------------------------------------------------------
+@@ -370,6 +399,7 @@ static void nativeStop(JNIEnv *, jclass, jlong handle) {
+ }
+ 
+ static jboolean nativeFlush(JNIEnv *, jclass, jlong handle) {
++    RtspLock lock(handle);
+     auto *r = toRaop(handle);
+     return (r && raopcl_flush(r)) ? JNI_TRUE : JNI_FALSE;
+ }
+@@ -377,12 +407,14 @@ static jboolean nativeFlush(JNIEnv *, jclass, jlong handle) {
+ // -- Volume & progress --
+ 
+ static jboolean nativeSetVolume(JNIEnv *, jclass, jlong handle, jfloat vol) {
++    RtspLock lock(handle);
+     auto *r = toRaop(handle);
+     return (r && raopcl_set_volume(r, vol)) ? JNI_TRUE : JNI_FALSE;
+ }
+ 
+ static jboolean nativeSetProgressMs(JNIEnv *, jclass, jlong handle,
+                                     jint elapsed, jint duration) {
++    RtspLock lock(handle);
+     auto *r = toRaop(handle);
+     return (r && raopcl_set_progress_ms(r,
+         static_cast<uint32_t>(elapsed),
+@@ -397,6 +429,7 @@ static jboolean nativeIsConnected(JNIEnv *, jclass, jlong handle) {
+ }
+ 
+ static jboolean nativeKeepalive(JNIEnv *, jclass, jlong handle) {
++    RtspLock lock(handle);
+     auto *r = toRaop(handle);
+     return (r && raopcl_keepalive(r)) ? JNI_TRUE : JNI_FALSE;
+ }
+@@ -434,6 +467,7 @@ static void nativeSetPassword(JNIEnv *env, jclass, jlong handle, jstring jPasswd
+ 
+ static jboolean nativeSetDaap(JNIEnv *env, jclass, jlong handle,
+                               jstring jTitle, jstring jArtist, jstring jAlbum) {
++    RtspLock lock(handle);
+     auto *r = toRaop(handle);
+     if (!r) return JNI_FALSE;
+ 
+@@ -456,6 +490,7 @@ static jboolean nativeSetDaap(JNIEnv *env, jclass, jlong handle,
+ static jboolean nativeSetArtwork(JNIEnv *env, jclass, jlong handle,
+                                  jbyteArray jImageData, jint length,
+                                  jstring jContentType) {
++    RtspLock lock(handle);
+     auto *r = toRaop(handle);
+     if (!r || !jImageData) return JNI_FALSE;
+ 
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt
 index 9d6e216..9f189d6 100644
 --- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt
