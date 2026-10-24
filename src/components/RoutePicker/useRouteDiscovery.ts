@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Cast, useCast } from 'react-native-queue-player';
-import { castReceiversStore } from '../../store/castReceiversStore';
+import { castDirectName, castReceiversStore, fingerprintFromPinError } from '../../store/castReceiversStore';
 import type { DiscoveryState, RouteInfo } from './types';
 
 export interface UseRouteDiscoveryResult {
@@ -27,7 +27,6 @@ export interface UseRouteDiscoveryResult {
  */
 export function useRouteDiscovery(): UseRouteDiscoveryResult {
   const snapshot = useCast();
-  const savedReceivers = castReceiversStore((s) => s.receivers);
   /** Raise the system prompt. Safe to call again — iOS shows it once, and a repeat
    *  call just re-reads the answer. */
   const requestPermission = useCallback(async () => {
@@ -101,23 +100,8 @@ export function useRouteDiscovery(): UseRouteDiscoveryResult {
     }));
     remote.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
 
-    // Self-hosted Cast receivers added in Settings: not discoverable through the
-    // Cast SDK, connected by certificate fingerprint instead.
-    const saved: RouteInfo[] = savedReceivers.map((r) => ({
-      id: r.id,
-      protocol: 'chromecast',
-      protocolVersion: '',
-      name: r.name,
-      modelName: '',
-      iconHint: 'speaker',
-      capabilities: { supportsRemoteVolume: true, streamingModel: 'pullUrl', requiresPairing: false },
-      isActive: snapshot.route.receiverId === r.id,
-      isConnecting: connectingIds.has(r.id),
-      lastError: errorById[r.id],
-    }));
-
-    return [localRoute, ...remote, ...saved];
-  }, [snapshot.receivers, snapshot.route, savedReceivers, connectingIds, errorById]);
+    return [localRoute, ...remote];
+  }, [snapshot.receivers, snapshot.route, connectingIds, errorById]);
 
   const connect = useCallback(
     async (receiverId: string, password?: string) => {
@@ -127,9 +111,22 @@ export function useRouteDiscovery(): UseRouteDiscoveryResult {
         return rest;
       });
       try {
-        const pin = castReceiversStore.getState().receivers.find((r) => r.id === receiverId)?.fingerprint;
+        // Self-hosted Cast receivers (`castdirect:`, from RNQP's own mDNS scan)
+        // authenticate by certificate pin, which rides as the connect password.
+        const directName = castDirectName(receiverId);
+        const pin = directName != null ? castReceiversStore.getState().pins[directName] : undefined;
         const secret = password ?? pin;
-        await Cast.connect(receiverId, secret ? { password: secret } : undefined);
+        try {
+          await Cast.connect(receiverId, secret ? { password: secret } : undefined);
+        } catch (err) {
+          // Trust on first use: an unpinned receiver rejects the empty pin with
+          // the SHA-256 it presented. Reconnect pinned to it and keep it only
+          // once that connect succeeds.
+          const seen = directName != null && !pin ? fingerprintFromPinError(err) : null;
+          if (!seen) throw err;
+          await Cast.connect(receiverId, { password: seen });
+          castReceiversStore.getState().pin(directName!, seen);
+        }
       } catch (err) {
         const code =
           (err as { code?: string; name?: string })?.code ??

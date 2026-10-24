@@ -15,45 +15,26 @@ import { CastReceiversCard } from '../CastReceiversCard';
 
 const GARAGE = '874a96ab4628f649e37176b35473642daf151d9f04b57bcc539d90fa81ba3824';
 
-function fill(name: string, host: string, port: string, fingerprint: string) {
-  fireEvent.changeText(screen.getByTestId('cast-receiver-name'), name);
-  fireEvent.changeText(screen.getByTestId('cast-receiver-host'), host);
-  fireEvent.changeText(screen.getByTestId('cast-receiver-port'), port);
-  fireEvent.changeText(screen.getByTestId('cast-receiver-fingerprint'), fingerprint);
-  fireEvent.press(screen.getByTestId('cast-receiver-add'));
-}
-
 describe('CastReceiversCard', () => {
-  beforeEach(() => castReceiversStore.setState({ receivers: [] }));
+  beforeEach(() => castReceiversStore.setState({ pins: {} }));
 
-  it('adds a receiver with a valid fingerprint and lists it', () => {
+  it('renders nothing until a receiver has been trusted', () => {
     render(<CastReceiversCard />);
-    fill('Garage Cast', '192.168.1.17', '8009', GARAGE.toUpperCase());
-    expect(castReceiversStore.getState().receivers).toEqual([
-      expect.objectContaining({ name: 'Garage Cast', host: '192.168.1.17', port: 8009, fingerprint: GARAGE }),
-    ]);
+    expect(screen.queryByTestId('cast-receiver-pin-0')).toBeNull();
+    expect(screen.queryByTestId('cast-receiver-add')).toBeNull();
+  });
+
+  it('lists trusted receivers with the start of their fingerprint', () => {
+    castReceiversStore.getState().pin('Garage Cast', GARAGE);
+    render(<CastReceiversCard />);
     expect(screen.getByText('Garage Cast')).toBeTruthy();
-    expect(screen.getByText('192.168.1.17:8009')).toBeTruthy();
+    expect(screen.getByTestId('cast-receiver-pin-0')).toHaveTextContent('SHA-256 874a96ab…');
   });
 
-  it('explains a truncated fingerprint instead of saving it', () => {
+  it('forgets a receiver so the next connect trusts it again', () => {
+    castReceiversStore.getState().pin('Garage Cast', GARAGE);
     render(<CastReceiversCard />);
-    fill('Garage Cast', '192.168.1.17', '8009', GARAGE.slice(0, 59));
-    expect(castReceiversStore.getState().receivers).toEqual([]);
-    expect(screen.getByTestId('cast-receiver-error')).toBeTruthy();
-  });
-
-  it('requires a host and a valid port', () => {
-    render(<CastReceiversCard />);
-    fill('Garage Cast', ' ', '8009', GARAGE);
-    fill('Garage Cast', '192.168.1.17', '99999', GARAGE);
-    expect(castReceiversStore.getState().receivers).toEqual([]);
-  });
-
-  it('removes a receiver', () => {
-    castReceiversStore.getState().add({ name: 'Garage Cast', host: '192.168.1.17', port: 8009, fingerprint: GARAGE });
-    render(<CastReceiversCard />);
-    fireEvent.press(screen.getByTestId('cast-receiver-remove-0'));
-    expect(castReceiversStore.getState().receivers).toEqual([]);
+    fireEvent.press(screen.getByTestId('cast-receiver-forget-0'));
+    expect(castReceiversStore.getState().pins).toEqual({});
   });
 });

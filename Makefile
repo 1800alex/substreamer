@@ -21,7 +21,7 @@ export EXPO_USE_PRECOMPILED_MODULES ?= 0
 export CI ?= 1
 
 .DEFAULT_GOAL := help
-.PHONY: help install prebuild apk adb-install clean distclean
+.PHONY: help install test prebuild apk adb-install clean distclean
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -31,6 +31,9 @@ node_modules/.package-lock.json: package.json package-lock.json
 	@touch $@
 
 install: node_modules/.package-lock.json ## Install npm dependencies
+
+test: install ## Run the Jest suite (FILES=path/to/test for a narrow run)
+	npx jest $(FILES)
 
 prebuild: install ## Generate the native android/ project
 	npx expo prebuild --platform android --clean --no-install

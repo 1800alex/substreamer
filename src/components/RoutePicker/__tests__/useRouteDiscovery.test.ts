@@ -10,31 +10,56 @@ const rnqp = require('react-native-queue-player');
 const GARAGE = '874a96ab4628f649e37176b35473642daf151d9f04b57bcc539d90fa81ba3824';
 const ID = 'castdirect:192.168.1.17:8009:Garage%20Cast';
 
-describe('useRouteDiscovery with saved Cast receivers', () => {
+describe('useRouteDiscovery with self-hosted Cast receivers', () => {
+  const mismatch = (seen: string) =>
+    new Error(`Receiver certificate SHA-256 ${seen} does not match the saved fingerprint`);
+  const pins = () => castReceiversStore.getState().pins;
+
   beforeEach(() => {
     rnqp.__resetPlayerMock();
-    rnqp.Cast.connect.mockClear();
-    castReceiversStore.setState({ receivers: [] });
-    castReceiversStore.getState().add({ name: 'Garage Cast', host: '192.168.1.17', port: 8009, fingerprint: GARAGE });
+    rnqp.Cast.connect.mockReset().mockResolvedValue(undefined);
+    castReceiversStore.setState({ pins: {} });
   });
 
-  it('lists saved receivers as Cast rows', () => {
-    const { result } = renderHook(() => useRouteDiscovery());
-    const row = result.current.routes.find((r) => r.id === ID);
-    expect(row).toMatchObject({ protocol: 'chromecast', name: 'Garage Cast', isActive: false });
-    expect(row?.capabilities.requiresPairing).toBe(false);
-  });
-
-  it('marks the saved receiver active when it is the current route', () => {
-    rnqp.__setCastSnapshot({ route: { castProtocol: 'chromecast', name: 'Garage Cast', receiverId: ID } });
-    const { result } = renderHook(() => useRouteDiscovery());
-    expect(result.current.routes.find((r) => r.id === ID)?.isActive).toBe(true);
-  });
-
-  it('connects with the saved fingerprint as the pin', async () => {
+  it('connects with the pinned fingerprint', async () => {
+    castReceiversStore.getState().pin('Garage Cast', GARAGE);
     const { result } = renderHook(() => useRouteDiscovery());
     await act(() => result.current.connect(ID));
+    expect(rnqp.Cast.connect).toHaveBeenCalledTimes(1);
     expect(rnqp.Cast.connect).toHaveBeenCalledWith(ID, { password: GARAGE });
+  });
+
+  it('pins the certificate the receiver presents on the first connect', async () => {
+    rnqp.Cast.connect.mockRejectedValueOnce(mismatch(GARAGE));
+    const { result } = renderHook(() => useRouteDiscovery());
+    await act(() => result.current.connect(ID));
+    expect(rnqp.Cast.connect).toHaveBeenNthCalledWith(1, ID, undefined);
+    expect(rnqp.Cast.connect).toHaveBeenNthCalledWith(2, ID, { password: GARAGE });
+    expect(pins()).toEqual({ 'Garage Cast': GARAGE });
+  });
+
+  it('saves nothing when the pinned retry fails', async () => {
+    rnqp.Cast.connect.mockRejectedValueOnce(mismatch(GARAGE)).mockRejectedValueOnce(new Error('Connection reset'));
+    const { result } = renderHook(() => useRouteDiscovery());
+    await expect(act(() => result.current.connect(ID))).rejects.toThrow('Connection reset');
+    expect(pins()).toEqual({});
+  });
+
+  it('never re-pins a receiver that already has a fingerprint', async () => {
+    castReceiversStore.getState().pin('Garage Cast', GARAGE);
+    rnqp.Cast.connect.mockRejectedValueOnce(mismatch('ab'.repeat(32)));
+    const { result } = renderHook(() => useRouteDiscovery());
+    await expect(act(() => result.current.connect(ID))).rejects.toThrow('does not match');
+    expect(rnqp.Cast.connect).toHaveBeenCalledTimes(1);
+    expect(pins()).toEqual({ 'Garage Cast': GARAGE });
+  });
+
+  it('does not pin for receivers other than castdirect ones', async () => {
+    rnqp.Cast.connect.mockRejectedValueOnce(mismatch(GARAGE));
+    const { result } = renderHook(() => useRouteDiscovery());
+    await expect(act(() => result.current.connect('chromecast:abc'))).rejects.toThrow('does not match');
+    expect(rnqp.Cast.connect).toHaveBeenCalledTimes(1);
+    expect(pins()).toEqual({});
   });
 });
 
@@ -52,7 +77,7 @@ describe('useRouteDiscovery row order', () => {
 
   beforeEach(() => {
     rnqp.__resetPlayerMock();
-    castReceiversStore.setState({ receivers: [] });
+    castReceiversStore.setState({ pins: {} });
   });
 
   it('adds a late receiver at the bottom even when RNQP lists it first', () => {
