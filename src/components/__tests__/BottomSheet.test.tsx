@@ -136,6 +136,16 @@ describe('BottomSheet', () => {
     expect(findStyleProp(toJSON(), (s) => s.maxHeight === 0.7 * height)).toBe(true);
   });
 
+  it('applies a fixed height (resolved to px) so the sheet does not grow with its content', () => {
+    const { height } = require('react-native').Dimensions.get('window');
+    const { toJSON } = render(
+      <BottomSheet visible={true} onClose={jest.fn()} height="60%">
+        <Text>Content</Text>
+      </BottomSheet>,
+    );
+    expect(findStyleProp(toJSON(), (s) => s.height === 0.6 * height)).toBe(true);
+  });
+
   it('caps to a numeric screen height when maxHeight is not provided', () => {
     // With no explicit maxHeight the sheet still caps to the screen (window
     // height minus the top inset and gap) so tall content can't run off the

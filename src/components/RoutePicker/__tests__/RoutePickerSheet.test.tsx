@@ -110,3 +110,91 @@ describe('RoutePickerSheet', () => {
     await flush();
   });
 });
+
+describe('RoutePickerSheet device detail', () => {
+  // Chromecast: the suite runs as iOS, where idle AirPlay rows are left to the
+  // system picker.
+  const tv = {
+    id: 'chromecast:tv',
+    castProtocol: 'chromecast',
+    protocolVersion: '',
+    name: 'Den TV',
+    modelName: '',
+    iconHint: 'tv',
+    capabilities: { supportsRemoteVolume: true, streamingModel: 'pushPcm', requiresPairing: false },
+  };
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    rnqp.Cast.connect.mockClear();
+    rnqp.Cast.disconnect.mockClear();
+    rnqp.Cast.setRouteVolume.mockClear();
+    rnqp.Cast.getLocalNetworkPermissionState.mockReturnValue('granted');
+    rnqp.__setCastSnapshot({ receivers: [tv] });
+    act(() => useRoutePickerStore.getState().open());
+  });
+
+  afterEach(() => {
+    act(() => useRoutePickerStore.getState().close());
+    jest.useRealTimers();
+  });
+
+  it('opens the device detail on tap instead of connecting', async () => {
+    render(<RoutePickerSheet />);
+    fireEvent.press(screen.getByTestId('route-row-chromecast:tv'));
+    expect(rnqp.Cast.connect).not.toHaveBeenCalled();
+    expect(screen.getByTestId('route-detail-connect')).toBeTruthy();
+    expect(screen.queryByTestId('route-row-local')).toBeNull();
+    fireEvent.press(screen.getByTestId('route-detail-back'));
+    expect(screen.getByTestId('route-row-local')).toBeTruthy();
+    await flush();
+  });
+
+  it('connects from the detail, applies the chosen volume, then closes', async () => {
+    render(<RoutePickerSheet />);
+    fireEvent.press(screen.getByTestId('route-row-chromecast:tv'));
+    fireEvent(screen.getByTestId('route-detail-volume'), 'valueChange', 0.3);
+    fireEvent.press(screen.getByTestId('route-detail-connect'));
+    await flush();
+    expect(rnqp.Cast.connect).toHaveBeenCalledWith('chromecast:tv', undefined);
+    expect(rnqp.Cast.setRouteVolume).toHaveBeenCalledWith(0.3);
+    act(() => jest.advanceTimersByTime(600));
+    expect(useRoutePickerStore.getState().isOpen).toBe(false);
+  });
+
+  it('stays on the detail with the error shown when the connect fails', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    rnqp.Cast.connect.mockRejectedValueOnce(Object.assign(new Error('boom'), { code: 'cast_connect_failed' }));
+    render(<RoutePickerSheet />);
+    fireEvent.press(screen.getByTestId('route-row-chromecast:tv'));
+    fireEvent.press(screen.getByTestId('route-detail-connect'));
+    await flush();
+    expect(rnqp.Cast.setRouteVolume).not.toHaveBeenCalled();
+    expect(screen.getByText(/Couldn't connect/)).toBeTruthy();
+    act(() => jest.advanceTimersByTime(600));
+    expect(useRoutePickerStore.getState().isOpen).toBe(true);
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('keeps the detail open, marked missing, when the device drops out of discovery', async () => {
+    const { rerender } = render(<RoutePickerSheet />);
+    fireEvent.press(screen.getByTestId('route-row-chromecast:tv'));
+    rnqp.__setCastSnapshot({ receivers: [] });
+    rerender(<RoutePickerSheet />);
+    expect(screen.getByText('No longer found')).toBeTruthy();
+    await flush();
+  });
+
+  it('switches back to this device in one tap', async () => {
+    rnqp.__setCastSnapshot({
+      receivers: [tv],
+      route: { castProtocol: 'chromecast', name: 'Den TV', receiverId: 'chromecast:tv' },
+    });
+    render(<RoutePickerSheet />);
+    fireEvent.press(screen.getByTestId('route-row-local'));
+    expect(rnqp.Cast.disconnect).toHaveBeenCalled();
+    expect(screen.queryByTestId('route-detail-connect')).toBeNull();
+    await flush();
+  });
+});

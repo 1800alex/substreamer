@@ -37,3 +37,49 @@ describe('useRouteDiscovery with saved Cast receivers', () => {
     expect(rnqp.Cast.connect).toHaveBeenCalledWith(ID, { password: GARAGE });
   });
 });
+
+describe('useRouteDiscovery row order', () => {
+  const receiver = (id: string, castProtocol: 'airplay' | 'chromecast') => ({
+    id,
+    castProtocol,
+    protocolVersion: '',
+    name: id,
+    modelName: '',
+    iconHint: 'speaker',
+    capabilities: { supportsRemoteVolume: true, streamingModel: 'pushPcm', requiresPairing: false },
+  });
+  const remoteIds = (routes: { id: string }[]) => routes.filter((r) => r.id.length > 0).map((r) => r.id);
+
+  beforeEach(() => {
+    rnqp.__resetPlayerMock();
+    castReceiversStore.setState({ receivers: [] });
+  });
+
+  it('adds a late receiver at the bottom even when RNQP lists it first', () => {
+    // RNQP publishes chromecastReceivers + airplayReceivers, so a late Chromecast
+    // arrives ahead of every AirPlay device.
+    rnqp.__setCastSnapshot({ receivers: [receiver('airplay:a', 'airplay')] });
+    const { result, rerender } = renderHook(() => useRouteDiscovery());
+    rnqp.__setCastSnapshot({
+      receivers: [receiver('chromecast:c', 'chromecast'), receiver('airplay:a', 'airplay')],
+    });
+    rerender({});
+    expect(remoteIds(result.current.routes)).toEqual(['airplay:a', 'chromecast:c']);
+  });
+
+  it('keeps the remaining rows in place when a receiver disappears', () => {
+    rnqp.__setCastSnapshot({
+      receivers: [receiver('airplay:a', 'airplay'), receiver('airplay:b', 'airplay')],
+    });
+    const { result, rerender } = renderHook(() => useRouteDiscovery());
+    rnqp.__setCastSnapshot({
+      receivers: [receiver('chromecast:c', 'chromecast'), receiver('airplay:a', 'airplay'), receiver('airplay:b', 'airplay')],
+    });
+    rerender({});
+    rnqp.__setCastSnapshot({
+      receivers: [receiver('chromecast:c', 'chromecast'), receiver('airplay:b', 'airplay')],
+    });
+    rerender({});
+    expect(remoteIds(result.current.routes)).toEqual(['airplay:b', 'chromecast:c']);
+  });
+});

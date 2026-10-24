@@ -133,6 +133,23 @@ describe('rowSubtitle', () => {
       "Chromecast • Couldn't connect",
     );
   });
+
+  it('asks for the PIN instead of reporting a failure while pairing waits on it', () => {
+    const roku = makeRoute({
+      protocol: 'airplay',
+      protocolVersion: '2',
+      modelName: '4640X',
+      lastError: 'Error',
+      capabilities: { supportsRemoteVolume: true, streamingModel: 'pushPcm', requiresPairing: true },
+    });
+    expect(rowSubtitle(roku, { awaitingPin: true })).toBe('Enter the PIN shown on your TV');
+  });
+
+  it('asks for the password when an auth-required receiver does not pair by PIN', () => {
+    expect(
+      rowSubtitle(makeRoute({ protocol: 'airplay', lastError: 'cast_auth_required' }), { awaitingPin: true }),
+    ).toBe('Enter the password for this device');
+  });
 });
 
 describe('a11y labels', () => {

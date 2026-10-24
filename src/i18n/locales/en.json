@@ -1176,6 +1176,10 @@
   "routeCastUnavailable": "Cast unavailable on this build",
   "routeConnect": "Connect",
   "routePinOrPassword": "PIN or password",
+  "routeEnterPinShownOnTv": "Enter the PIN shown on your TV",
+  "routeEnterDevicePassword": "Enter the password for this device",
+  "routeNoLongerFound": "No longer found",
+  "routeBack": "Back to devices",
   "routeAirplayBluetooth": "AirPlay & Bluetooth",
   "routeOpenSystemPicker": "Open system picker",
   "routeOpenSystemPickerA11y": "Open AirPlay and Bluetooth device picker"

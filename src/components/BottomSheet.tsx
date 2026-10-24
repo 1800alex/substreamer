@@ -57,6 +57,12 @@ interface BottomSheetProps {
   closeable?: boolean;
   maxHeight?: DimensionValue;
   /**
+   * Fixed sheet height (px, or a percentage of the window). The sheet keeps
+   * this height whatever its content, so rows don't move as content arrives;
+   * still capped to the screen and above the keyboard.
+   */
+  height?: DimensionValue;
+  /**
    * Wrap children in a vertical ScrollView so tall content scrolls within the
    * sheet instead of overflowing off the top of the screen. Default `true`.
    * Pass `false` for sheets that supply their own scroll container (FlatList /
@@ -72,6 +78,7 @@ export function BottomSheet({
   onCloseComplete,
   closeable = true,
   maxHeight,
+  height,
   scrollable = true,
   children,
 }: BottomSheetProps) {
@@ -86,15 +93,16 @@ export function BottomSheet({
   // sheet must fit between the keyboard top and the screen cap, with its inner
   // scroll/list handling the overflow.
   const screenCap = windowHeight - insets.top - TOP_GAP;
-  let resolvedMaxHeight = screenCap;
-  if (typeof maxHeight === 'number') {
-    resolvedMaxHeight = Math.min(maxHeight, screenCap);
-  } else if (typeof maxHeight === 'string') {
-    const pct = parseFloat(maxHeight);
-    if (Number.isFinite(pct)) {
-      resolvedMaxHeight = Math.min((pct / 100) * windowHeight, screenCap);
+  const resolveHeight = (value: DimensionValue | undefined): number | undefined => {
+    if (typeof value === 'number') return Math.min(value, screenCap);
+    if (typeof value === 'string') {
+      const pct = parseFloat(value);
+      if (Number.isFinite(pct)) return Math.min((pct / 100) * windowHeight, screenCap);
     }
-  }
+    return undefined;
+  };
+  const resolvedMaxHeight = resolveHeight(maxHeight) ?? screenCap;
+  const resolvedHeight = resolveHeight(height);
 
   const [internalVisible, setInternalVisible] = useState(false);
   const isClosing = useRef(false);
@@ -284,6 +292,9 @@ export function BottomSheet({
       // put, content scrolls) instead of hiding behind the keyboard.
       transform: [{ translateY: translateY.value - keyboardHeight }],
       maxHeight: Math.min(resolvedMaxHeight, screenCap - keyboardHeight),
+      ...(resolvedHeight !== undefined && {
+        height: Math.min(resolvedHeight, screenCap - keyboardHeight),
+      }),
       // Collapse the bottom safe-area padding as the keyboard rises: the keyboard
       // occupies the home-indicator area, so keeping insets.bottom there would
       // over-lift the content ~34px, leaving a dead gap above the keyboard.

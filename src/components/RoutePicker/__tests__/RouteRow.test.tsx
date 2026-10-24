@@ -31,36 +31,24 @@ function route(overrides: Partial<RouteInfo> = {}): RouteInfo {
 }
 
 function renderRow(r: RouteInfo) {
-  const onConnect = jest.fn();
-  render(<RouteRow route={r} onConnect={onConnect} onDisconnect={jest.fn()} theme={theme} />);
-  return onConnect;
+  const onPress = jest.fn();
+  render(<RouteRow route={r} onPress={onPress} theme={theme} />);
+  return onPress;
 }
 
-describe('RouteRow pairing', () => {
-  it('starts the connect on the first tap so the receiver displays its PIN', () => {
-    const onConnect = renderRow(route());
+describe('RouteRow press', () => {
+  it('hands the tapped route to onPress and never connects by itself', () => {
+    const onPress = renderRow(route());
     fireEvent.press(screen.getByTestId('route-row-airplay:roku'));
-    expect(onConnect).toHaveBeenCalledWith('airplay:roku', undefined);
-    expect(screen.getByTestId('route-row-airplay:roku-pin')).toBeTruthy();
-  });
-
-  it('does not restart pairing when a PIN is already being requested', () => {
-    const onConnect = renderRow(route({ lastError: 'cast_auth_required' }));
-    // The auth-required error already expanded the PIN box.
-    expect(screen.getByTestId('route-row-airplay:roku-pin')).toBeTruthy();
-    fireEvent.changeText(screen.getByTestId('route-row-airplay:roku-pin'), '1234');
-    fireEvent.press(screen.getByTestId('route-row-airplay:roku-submit'));
-    expect(onConnect).toHaveBeenCalledTimes(1);
-    expect(onConnect).toHaveBeenCalledWith('airplay:roku', '1234');
-  });
-
-  it('connects straight away for receivers that need no pairing', () => {
-    const onConnect = renderRow(
-      route({ capabilities: { supportsRemoteVolume: true, requiresPairing: false } as RouteInfo['capabilities'] }),
-    );
-    fireEvent.press(screen.getByTestId('route-row-airplay:roku'));
-    expect(onConnect).toHaveBeenCalledWith('airplay:roku', undefined);
+    expect(onPress).toHaveBeenCalledWith(expect.objectContaining({ id: 'airplay:roku' }));
     expect(screen.queryByTestId('route-row-airplay:roku-pin')).toBeNull();
+  });
+
+  it('shows the derived subtitle unless overridden', () => {
+    renderRow(route());
+    expect(screen.getByText('AirPlay 2 • 4640X')).toBeTruthy();
+    render(<RouteRow route={route({ id: '', protocol: 'local' })} onPress={jest.fn()} subtitleOverride="Tap me" theme={theme} />);
+    expect(screen.getByText('Tap me')).toBeTruthy();
   });
 });
 

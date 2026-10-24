@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Cast, useCast } from 'react-native-queue-player';
 import { castReceiversStore } from '../../store/castReceiversStore';
 import type { DiscoveryState, RouteInfo } from './types';
@@ -38,6 +38,10 @@ export function useRouteDiscovery(): UseRouteDiscoveryResult {
   }, []);
   const [connectingIds, setConnectingIds] = useState<Set<string>>(new Set());
   const [errorById, setErrorById] = useState<Record<string, string>>({});
+  /** Receiver ids in first-seen order. RNQP lists Chromecasts before AirPlay
+   *  devices, so a late Chromecast would otherwise land above rows the user is
+   *  about to tap; new devices go to the bottom instead. */
+  const seenOrderRef = useRef<string[]>([]);
 
   useEffect(() => {
     // The probe is what resolves `permission` (discovery alone never does) and,
@@ -78,6 +82,11 @@ export function useRouteDiscovery(): UseRouteDiscoveryResult {
       isConnecting: false,
     };
 
+    const present = new Set(snapshot.receivers.map((r) => r.id));
+    const order = seenOrderRef.current.filter((id) => present.has(id));
+    for (const r of snapshot.receivers) if (!order.includes(r.id)) order.push(r.id);
+    seenOrderRef.current = order;
+
     const remote: RouteInfo[] = snapshot.receivers.map((r) => ({
       id: r.id,
       protocol: r.castProtocol,
@@ -90,6 +99,7 @@ export function useRouteDiscovery(): UseRouteDiscoveryResult {
       isConnecting: connectingIds.has(r.id),
       lastError: errorById[r.id],
     }));
+    remote.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
 
     // Self-hosted Cast receivers added in Settings: not discoverable through the
     // Cast SDK, connected by certificate fingerprint instead.

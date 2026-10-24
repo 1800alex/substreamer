@@ -1,7 +1,5 @@
 import MaterialCommunityIcons from '@react-native-vector-icons/material-design-icons/static';
-import { useEffect, useState } from 'react';
-import { useTranslation } from 'react-i18next';
-import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { OutputVolumeSlider } from '../OutputVolumeSlider';
 import {
@@ -15,14 +13,9 @@ import { type RouteInfo, type RoutePickerTheme } from './types';
 
 export interface RouteRowProps {
   route: RouteInfo;
-  /**
-   * Fired on row tap. If the row's `lastError === 'cast_auth_required'`, the
-   * row first expands an inline PIN/password field and only fires `onConnect`
-   * after the user submits.
-   */
-  onConnect: (id: string, password?: string) => void;
-  /** Fired on tap of the active row — disconnects. */
-  onDisconnect: () => void;
+  /** Fired on row tap. The sheet decides what a tap does (open the device
+   *  detail, or switch back to this device); the row never connects. */
+  onPress: (route: RouteInfo) => void;
   /** Replaces the derived protocol subtitle (used for the local row). */
   subtitleOverride?: string;
   theme: RoutePickerTheme;
@@ -30,41 +23,10 @@ export interface RouteRowProps {
 
 /**
  * Single device row: icon + name + subtitle + trailing accessory (spinner /
- * check / error / chevron). Inline PIN expander for AirPlay pair auth so the
- * user doesn't leave the picker. The inline field is a plain TextInput — the
- * host BottomSheet lifts itself above the keyboard.
+ * check / error / chevron), plus a live volume slider under the active
+ * receiver.
  */
-export function RouteRow({ route, onConnect, onDisconnect, subtitleOverride, theme: t }: RouteRowProps) {
-  const { t: tr } = useTranslation();
-  const [pinExpanded, setPinExpanded] = useState(false);
-  const [pin, setPin] = useState('');
-  const [pinFocused, setPinFocused] = useState(false);
-
-  useEffect(() => {
-    if (route.lastError === 'cast_auth_required') {
-      setPinExpanded(true);
-    }
-  }, [route.lastError]);
-
-  const needsPair =
-    route.lastError === 'cast_auth_required' || route.capabilities.requiresPairing;
-
-  const handlePress = () => {
-    if (route.isActive || route.protocol === 'local') {
-      onDisconnect();
-      return;
-    }
-    if (needsPair && !pinExpanded) {
-      setPinExpanded(true);
-      // The receiver only shows its PIN once a connect asks for it
-      // (/pair-pin-start), so start one unless an auth-required error says
-      // that already happened.
-      if (route.lastError !== 'cast_auth_required') onConnect(route.id, undefined);
-      return;
-    }
-    onConnect(route.id, pinExpanded && pin.length > 0 ? pin : undefined);
-  };
-
+export function RouteRow({ route, onPress, subtitleOverride, theme: t }: RouteRowProps) {
   const displayName =
     route.protocol === 'local'
       ? localRouteDisplayName()
@@ -76,7 +38,7 @@ export function RouteRow({ route, onConnect, onDisconnect, subtitleOverride, the
     <View>
       <Pressable
         testID={`route-row-${route.id || 'local'}`}
-        onPress={handlePress}
+        onPress={() => onPress(route)}
         accessibilityRole="button"
         accessibilityLabel={
           route.isActive ? stopCastingA11yLabel(displayName) : startCastingA11yLabel(displayName)
@@ -119,44 +81,6 @@ export function RouteRow({ route, onConnect, onDisconnect, subtitleOverride, the
           <OutputVolumeSlider accent={t.accent} track={t.border} icon={t.textSubtle} />
         </View>
       )}
-      {pinExpanded && !route.isActive && (
-        <View style={[styles.pairRow, { backgroundColor: t.surface, borderBottomColor: t.border }]}>
-          <TextInput
-            testID={`route-row-${route.id || 'local'}-pin`}
-            value={pin}
-            onChangeText={setPin}
-            onFocus={() => setPinFocused(true)}
-            onBlur={() => setPinFocused(false)}
-            placeholder={tr('routePinOrPassword')}
-            placeholderTextColor={t.textSubtle}
-            secureTextEntry
-            autoCapitalize="none"
-            autoCorrect={false}
-            autoFocus
-            style={[
-              styles.pinInput,
-              {
-                color: t.text,
-                backgroundColor: t.background,
-                borderColor: pinFocused ? t.accent : t.border,
-                borderWidth: pinFocused ? 1.5 : 1,
-              },
-            ]}
-          />
-          <Pressable
-            testID={`route-row-${route.id || 'local'}-submit`}
-            onPress={() => onConnect(route.id, pin)}
-            disabled={pin.length === 0}
-            style={({ pressed }) => [
-              styles.submit,
-              { backgroundColor: pin.length === 0 ? t.border : t.accent },
-              pressed && { opacity: 0.7 },
-            ]}
-          >
-            <Text style={{ color: t.background, fontSize: 13, fontWeight: '700' }}>{tr('routeConnect')}</Text>
-          </Pressable>
-        </View>
-      )}
     </View>
   );
 }
@@ -179,30 +103,9 @@ const styles = StyleSheet.create({
   },
   labelStack: { flex: 1, gap: 2 },
   accessory: { width: 28, alignItems: 'center', justifyContent: 'center' },
-  pairRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    gap: 8,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-  },
   volumeRow: {
     paddingHorizontal: 16,
     paddingVertical: 4,
     borderBottomWidth: StyleSheet.hairlineWidth,
-  },
-  pinInput: {
-    flex: 1,
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 15,
-    minHeight: 40,
-  },
-  submit: {
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 8,
   },
 });

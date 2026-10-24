@@ -20,9 +20,19 @@ export function listeningOnLabel(): string {
   return i18n.t('routeListeningOn');
 }
 
-/** Subtitle line under the device name on each row. */
-export function rowSubtitle(route: RouteInfo): string {
+/**
+ * Subtitle line under the device name on each row. `awaitingPin` is set while
+ * the row's pairing field is open and nothing has been submitted yet: the
+ * first connect of a pairing receiver rejects by design once the receiver is
+ * showing its PIN, so that error is a prompt, not a failure.
+ */
+export function rowSubtitle(route: RouteInfo, { awaitingPin = false } = {}): string {
   if (route.protocol === 'local') return i18n.t('routeCurrentlyListeningHere');
+  if (awaitingPin) {
+    return route.capabilities.requiresPairing
+      ? i18n.t('routeEnterPinShownOnTv')
+      : i18n.t('routeEnterDevicePassword');
+  }
   const protoBits: string[] = [];
   if (route.protocol === 'airplay') {
     protoBits.push(`AirPlay${route.protocolVersion ? ' ' + route.protocolVersion : ''}`);

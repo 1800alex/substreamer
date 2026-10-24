@@ -1,5 +1,5 @@
 import MaterialCommunityIcons from '@react-native-vector-icons/material-design-icons/static';
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Linking, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { Cast, useAudioRoute } from 'react-native-queue-player';
@@ -10,6 +10,7 @@ import {
   listeningOnLabel,
   systemRouteActiveLocalSubtitle,
 } from './copy';
+import { RouteDetail } from './RouteDetail';
 import { RouteRow } from './RouteRow';
 import { type RouteInfo, type RoutePickerTheme } from './types';
 import { useRouteDiscovery } from './useRouteDiscovery';
@@ -22,6 +23,12 @@ import { useRoutePickerTheme } from './useRoutePickerTheme';
  */
 const ACTIVE_HIGHLIGHT_HOLD_MS = 600;
 
+/**
+ * Fixed sheet height. A content-sized sheet grew as receivers were discovered,
+ * moving every row under the user's finger.
+ */
+const SHEET_HEIGHT = '60%';
+
 export interface RoutePickerSheetProps {
   /** Optional theme override; falls back to the app theme. */
   theme?: Partial<RoutePickerTheme>;
@@ -32,15 +39,16 @@ export interface RoutePickerSheetProps {
  * contained, like the app's other global sheets); any screen opens it via
  * `useRoutePickerStore().open()`. Discovery lives in an inner component so it
  * only runs while the sheet is open (our BottomSheet unmounts its children when
- * hidden). PIN entry for AirPlay pairing is inline; the sheet lifts above the
- * keyboard via the shared BottomSheet.
+ * hidden). Tapping a receiver opens its detail view (connect volume, PIN entry,
+ * the connect button) rather than connecting, so a mistap can't move playback;
+ * the sheet lifts above the keyboard via the shared BottomSheet.
  */
 export function RoutePickerSheet({ theme }: RoutePickerSheetProps = {}) {
   const t = useRoutePickerTheme(theme);
   const isOpen = useRoutePickerStore((s) => s.isOpen);
   const close = useRoutePickerStore((s) => s.close);
   return (
-    <BottomSheet visible={isOpen} onClose={close} maxHeight="75%">
+    <BottomSheet visible={isOpen} onClose={close} height={SHEET_HEIGHT}>
       {isOpen && <RoutePickerContent theme={t} onClose={close} />}
     </BottomSheet>
   );
@@ -58,6 +66,13 @@ function RoutePickerContent({ theme: t, onClose }: { theme: RoutePickerTheme; on
 
   const { routes, state, connect, disconnect, requestPermission } = useRouteDiscovery();
   const audioRoute = useAudioRoute();
+
+  // The receiver whose detail view is open. The last-seen row is kept so the
+  // view survives the receiver dropping out of discovery (shown as missing).
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const lastSelectedRef = useRef<RouteInfo | null>(null);
+  const liveSelected = selectedId == null ? undefined : routes.find((r) => r.id === selectedId);
+  if (liveSelected) lastSelectedRef.current = liveSelected;
 
   // iOS AirPlay / Bluetooth are OS-managed — they surface as the system audio
   // route, not a discovered receiver. The "AirPlay & Bluetooth" row stands in
@@ -87,9 +102,15 @@ function RoutePickerContent({ theme: t, onClose }: { theme: RoutePickerTheme; on
   const showSearching = state === 'scanning' && discoveredRoutes.length === 0;
 
   const handleConnect = useCallback(
-    (id: string, password?: string) => {
+    (id: string, password: string | undefined, volume: number | undefined) => {
       connect(id, password)
         .then(() => {
+          // RNQP has no connect-time volume, so set it as soon as the route is live.
+          if (volume !== undefined) {
+            Cast.setRouteVolume(volume).catch(() => {
+              /* the receiver keeps its own volume; the slider still controls it */
+            });
+          }
           // Route is live + the row is marked active. Hold so its highlight
           // paints, then dismiss (which stops discovery via unmount).
           if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
@@ -112,6 +133,34 @@ function RoutePickerContent({ theme: t, onClose }: { theme: RoutePickerTheme; on
     [connect, onClose],
   );
 
+  const handleRowPress = useCallback(
+    (route: RouteInfo) => {
+      // Switching back to this device is always safe, so it stays one tap.
+      if (route.protocol === 'local') {
+        void disconnect();
+        return;
+      }
+      lastSelectedRef.current = route;
+      setSelectedId(route.id);
+    },
+    [disconnect],
+  );
+
+  const detailRoute = liveSelected ?? (selectedId != null ? lastSelectedRef.current : null);
+  if (detailRoute) {
+    return (
+      <RouteDetail
+        key={detailRoute.id}
+        route={detailRoute}
+        missing={!liveSelected}
+        onConnect={handleConnect}
+        onDisconnect={() => void disconnect()}
+        onBack={() => setSelectedId(null)}
+        theme={t}
+      />
+    );
+  }
+
   return (
     <View>
       <View style={styles.header}>
@@ -123,8 +172,7 @@ function RoutePickerContent({ theme: t, onClose }: { theme: RoutePickerTheme; on
             <RouteRow
               route={r}
               subtitleOverride={localSubtitleOverride(r, systemRouteActive)}
-              onConnect={handleConnect}
-              onDisconnect={() => void disconnect()}
+              onPress={handleRowPress}
               theme={t}
             />
             {Platform.OS === 'ios' && idx === 0 && (
