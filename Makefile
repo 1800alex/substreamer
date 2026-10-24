@@ -21,7 +21,7 @@ export EXPO_USE_PRECOMPILED_MODULES ?= 0
 export CI ?= 1
 
 .DEFAULT_GOAL := help
-.PHONY: help install test prebuild apk adb-install clean distclean
+.PHONY: help install test test-rnqp prebuild apk adb-install clean distclean
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -34,6 +34,9 @@ install: node_modules/.package-lock.json ## Install npm dependencies
 
 test: install ## Run the Jest suite (FILES=path/to/test for a narrow run)
 	npx jest $(FILES)
+
+test-rnqp: ## Run react-native-queue-player's Android JVM tests offline (FILTER='pkg.Class*' to narrow)
+	scripts/test-rnqp.sh $(FILTER)
 
 prebuild: install ## Generate the native android/ project
 	npx expo prebuild --platform android --clean --no-install

@@ -25,8 +25,9 @@ export interface RouteDetailProps {
 /**
  * Second step of picking a receiver: the list only opens this view, and only
  * the button here connects, so a row that moved under a tap can't take over
- * playback. Holds the connect volume and the PIN/password entry for AirPlay
- * pairing (the host BottomSheet lifts itself above the keyboard).
+ * playback. Holds the connect volume, the PIN/password entry for AirPlay
+ * pairing (the host BottomSheet lifts itself above the keyboard), and the
+ * certificate a self-hosted Cast receiver presented when it needs trusting.
  */
 export function RouteDetail({ route, missing, onConnect, onDisconnect, onBack, theme: t }: RouteDetailProps) {
   const { t: tr } = useTranslation();
@@ -45,7 +46,13 @@ export function RouteDetail({ route, missing, onConnect, onDisconnect, onBack, t
     rememberConnectVolume(route.id, value);
   };
 
+  const trust = route.isActive ? undefined : route.trust;
+
   const handleConnect = () => {
+    if (trust) {
+      onConnect(route.id, trust.fingerprint, connectVolume);
+      return;
+    }
     if (pinExpanded) {
       setPinSubmitted(true);
       onConnect(route.id, pin, connectVolume);
@@ -61,7 +68,7 @@ export function RouteDetail({ route, missing, onConnect, onDisconnect, onBack, t
 
   const awaitingPin = pinExpanded && !pinSubmitted;
   const subtitle = missing ? tr('routeNoLongerFound') : rowSubtitle(route, { awaitingPin });
-  const connectDisabled = missing || route.isConnecting || (pinExpanded && pin.length === 0);
+  const connectDisabled = missing || route.isConnecting || (pinExpanded && !route.trust && pin.length === 0);
 
   return (
     <View>
@@ -114,7 +121,25 @@ export function RouteDetail({ route, missing, onConnect, onDisconnect, onBack, t
         </View>
       )}
 
-      {pinExpanded && !route.isActive && (
+      {trust && (
+        <View testID="route-detail-trust" style={[styles.section, styles.trust]}>
+          <Text style={{ color: trust.changed ? t.errorIndicator : t.text, fontSize: 15, fontWeight: '700' }}>
+            {tr(trust.changed ? 'castTrustChangedTitle' : 'castTrustTitle')}
+          </Text>
+          <Text style={{ color: t.textSubtle, fontSize: 13, lineHeight: 18 }}>
+            {tr(trust.changed ? 'castTrustChangedDescription' : 'castTrustDescription', { name: route.name })}
+          </Text>
+          <Text style={{ color: t.textSubtle, fontSize: 12, fontWeight: '600' }}>{tr('sha256Fingerprint')}</Text>
+          <View style={[styles.fingerprintCard, { backgroundColor: t.background, borderColor: t.border }]}>
+            {/* Grouped like `openssl x509 -fingerprint`, for comparing on the receiver. */}
+            <Text testID="route-detail-fingerprint" selectable style={[styles.fingerprint, { color: t.text }]}>
+              {groupFingerprint(trust.fingerprint)}
+            </Text>
+          </View>
+        </View>
+      )}
+
+      {pinExpanded && !route.isActive && !trust && (
         <View style={styles.section}>
           <TextInput
             testID="route-detail-pin"
@@ -162,7 +187,7 @@ export function RouteDetail({ route, missing, onConnect, onDisconnect, onBack, t
             accessibilityState={{ disabled: connectDisabled, busy: route.isConnecting }}
             style={({ pressed }) => [
               styles.button,
-              { backgroundColor: connectDisabled ? t.border : t.accent },
+              { backgroundColor: connectDisabled ? t.border : trust?.changed ? t.errorIndicator : t.accent },
               pressed && { opacity: 0.7 },
             ]}
           >
@@ -170,7 +195,7 @@ export function RouteDetail({ route, missing, onConnect, onDisconnect, onBack, t
               <ActivityIndicator testID="route-detail-connecting" color={t.background} />
             ) : (
               <Text style={{ color: t.background, fontSize: 15, fontWeight: '700' }} numberOfLines={1}>
-                {pinExpanded ? tr('routeConnect') : startCastingA11yLabel(route.name)}
+                {trust ? tr('castTrustConnect') : pinExpanded ? tr('routeConnect') : startCastingA11yLabel(route.name)}
               </Text>
             )}
           </Pressable>
@@ -178,6 +203,11 @@ export function RouteDetail({ route, missing, onConnect, onDisconnect, onBack, t
       </View>
     </View>
   );
+}
+
+/** `ab12…` → `AB:12:…`. */
+function groupFingerprint(hex: string): string {
+  return (hex.toUpperCase().match(/../g) ?? []).join(':');
 }
 
 const styles = StyleSheet.create({
@@ -200,6 +230,9 @@ const styles = StyleSheet.create({
   section: { paddingHorizontal: 16, paddingVertical: 8 },
   volumeRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   slider: { flex: 1, height: 40 },
+  trust: { gap: 8 },
+  fingerprintCard: { borderRadius: 8, borderWidth: StyleSheet.hairlineWidth, padding: 10 },
+  fingerprint: { fontFamily: 'monospace', fontSize: 12, lineHeight: 17 },
   pinInput: {
     borderRadius: 8,
     paddingHorizontal: 12,

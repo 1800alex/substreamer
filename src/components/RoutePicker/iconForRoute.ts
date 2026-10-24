@@ -13,6 +13,7 @@ export function iconForRoute(route: RouteInfo): RouteIconName {
     return 'cellphone';
   }
   if (route.protocol === 'airplay') return 'cast-audio';
+  if (route.protocol === 'mpd') return 'speaker';
   if (route.protocol === 'chromecast') {
     return route.isActive ? 'cast-connected' : 'cast';
   }

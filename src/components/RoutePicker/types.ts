@@ -9,9 +9,23 @@ import type {
  * derived UI fields (`isActive`, `isConnecting`, `lastError`) that the picker
  * layer tracks.
  */
+/**
+ * RNQP's protocol, plus `mpd` for Music Player Daemon servers (RNQP reports
+ * them as `chromecast` pull-URL receivers with an `mpd:` id).
+ */
+export type RouteProtocol = CastProtocol | 'mpd';
+
+/** A self-hosted Cast receiver's certificate awaiting the user's trust. */
+export interface RouteTrust {
+  /** SHA-256 of the certificate it presented (lowercase hex). */
+  fingerprint: string;
+  /** True when a different certificate was pinned for this receiver. */
+  changed: boolean;
+}
+
 export interface RouteInfo {
   id: string;
-  protocol: CastProtocol;
+  protocol: RouteProtocol;
   protocolVersion: string;
   name: string;
   modelName: string;
@@ -23,6 +37,8 @@ export interface RouteInfo {
   isConnecting: boolean;
   /** Last connect error code surfaced to the user (resets on next attempt). */
   lastError?: string;
+  /** Set when connecting needs the user to trust the receiver's certificate. */
+  trust?: RouteTrust;
 }
 
 /**

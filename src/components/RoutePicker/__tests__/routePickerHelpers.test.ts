@@ -145,6 +145,16 @@ describe('rowSubtitle', () => {
     expect(rowSubtitle(roku, { awaitingPin: true })).toBe('Enter the PIN shown on your TV');
   });
 
+  it('describes an MPD server and warns that playing replaces its queue', () => {
+    expect(rowSubtitle(makeRoute({ protocol: 'mpd', modelName: 'MPD' }))).toBe('MPD • Replaces its queue');
+  });
+
+  it('says a self-hosted receiver waits on trust rather than failing', () => {
+    expect(rowSubtitle(makeRoute({ protocol: 'chromecast', lastError: 'cast_trust_required' }))).toBe(
+      'Chromecast • Not trusted yet',
+    );
+  });
+
   it('asks for the password when an auth-required receiver does not pair by PIN', () => {
     expect(
       rowSubtitle(makeRoute({ protocol: 'airplay', lastError: 'cast_auth_required' }), { awaitingPin: true }),

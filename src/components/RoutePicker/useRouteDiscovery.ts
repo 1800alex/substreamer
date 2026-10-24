@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Cast, useCast } from 'react-native-queue-player';
 import { castDirectName, castReceiversStore, fingerprintFromPinError } from '../../store/castReceiversStore';
-import type { DiscoveryState, RouteInfo } from './types';
+import type { DiscoveryState, RouteInfo, RouteTrust } from './types';
+
+/** Rejection code when a self-hosted Cast receiver's certificate needs the user's trust. */
+export const CAST_TRUST_REQUIRED = 'cast_trust_required';
 
 export interface UseRouteDiscoveryResult {
   /** All discovered receivers plus the local route, with isActive flags. */
@@ -37,6 +40,7 @@ export function useRouteDiscovery(): UseRouteDiscoveryResult {
   }, []);
   const [connectingIds, setConnectingIds] = useState<Set<string>>(new Set());
   const [errorById, setErrorById] = useState<Record<string, string>>({});
+  const [trustById, setTrustById] = useState<Record<string, RouteTrust>>({});
   /** Receiver ids in first-seen order. RNQP lists Chromecasts before AirPlay
    *  devices, so a late Chromecast would otherwise land above rows the user is
    *  about to tap; new devices go to the bottom instead. */
@@ -88,7 +92,7 @@ export function useRouteDiscovery(): UseRouteDiscoveryResult {
 
     const remote: RouteInfo[] = snapshot.receivers.map((r) => ({
       id: r.id,
-      protocol: r.castProtocol,
+      protocol: r.id.startsWith('mpd:') ? 'mpd' : r.castProtocol,
       protocolVersion: r.protocolVersion,
       name: r.name,
       modelName: r.modelName,
@@ -97,11 +101,12 @@ export function useRouteDiscovery(): UseRouteDiscoveryResult {
       isActive: snapshot.route.receiverId === r.id,
       isConnecting: connectingIds.has(r.id),
       lastError: errorById[r.id],
+      trust: trustById[r.id],
     }));
     remote.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
 
     return [localRoute, ...remote];
-  }, [snapshot.receivers, snapshot.route, connectingIds, errorById]);
+  }, [snapshot.receivers, snapshot.route, connectingIds, errorById, trustById]);
 
   const connect = useCallback(
     async (receiverId: string, password?: string) => {
@@ -113,20 +118,25 @@ export function useRouteDiscovery(): UseRouteDiscoveryResult {
       try {
         // Self-hosted Cast receivers (`castdirect:`, from RNQP's own mDNS scan)
         // authenticate by certificate pin, which rides as the connect password.
+        // A `password` here is a fingerprint the user accepted in RouteDetail.
         const directName = castDirectName(receiverId);
         const pin = directName != null ? castReceiversStore.getState().pins[directName] : undefined;
         const secret = password ?? pin;
         try {
           await Cast.connect(receiverId, secret ? { password: secret } : undefined);
         } catch (err) {
-          // Trust on first use: an unpinned receiver rejects the empty pin with
-          // the SHA-256 it presented. Reconnect pinned to it and keep it only
-          // once that connect succeeds.
-          const seen = directName != null && !pin ? fingerprintFromPinError(err) : null;
-          if (!seen) throw err;
-          await Cast.connect(receiverId, { password: seen });
-          castReceiversStore.getState().pin(directName!, seen);
+          // The receiver presented a certificate nobody trusted yet (first
+          // contact, or not the pinned one): show it and ask, never pin silently.
+          const seen = directName != null ? fingerprintFromPinError(err) : null;
+          if (seen == null) throw err;
+          setTrustById((prev) => ({ ...prev, [receiverId]: { fingerprint: seen, changed: pin != null } }));
+          throw Object.assign(new Error('Receiver certificate needs trust'), { code: CAST_TRUST_REQUIRED });
         }
+        if (directName != null && password != null) castReceiversStore.getState().pin(directName, password);
+        setTrustById((prev) => {
+          const { [receiverId]: _drop, ...rest } = prev;
+          return rest;
+        });
       } catch (err) {
         const code =
           (err as { code?: string; name?: string })?.code ??

@@ -8,9 +8,9 @@ import { settingsStyles } from '../../styles/settingsStyles';
 import { SettingsSectionTitle } from './SettingsSectionTitle';
 
 /**
- * Self-hosted Cast receivers (no Google device certificate) trusted on their
- * first connect from the route picker. Forgetting one lets the next connect
- * trust a new certificate, e.g. after the receiver regenerated its identity.
+ * Self-hosted Cast receivers (no Google device certificate) the user trusted
+ * from the route picker, which shows the certificate and asks first (and asks
+ * again when it changes). Forgetting one removes its saved certificate.
  */
 export function CastReceiversCard() {
   const { t } = useTranslation();

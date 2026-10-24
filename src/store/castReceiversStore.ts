@@ -7,9 +7,10 @@ import { kvStorage } from './persistence';
  * Certificate pins for self-hosted Cast receivers. RNQP finds them with its
  * own `_googlecast._tcp` mDNS scan (they have no Google device certificate, so
  * the Cast SDK never lists them) and reports them as `castdirect:` receivers.
- * The first connect trusts whatever certificate the receiver presents and
- * pins its SHA-256 here, keyed by receiver name so a new IP address keeps the
- * pin; later connects only succeed while the certificate matches.
+ * The route picker shows the certificate a receiver presents and asks the user
+ * to trust it (again if it changes); a trusted SHA-256 is pinned here, keyed
+ * by receiver name so a new IP address keeps the pin. Connects only succeed
+ * while the certificate matches.
  */
 const DIRECT_PREFIX = 'castdirect:';
 

@@ -644,10 +644,10 @@ index 81f8a83..4212a0c 100644
      if (!r || !jImageData) return JNI_FALSE;
  
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt
-index 9d6e216..30d0680 100644
+index 9d6e216..c101f45 100644
 --- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt
 +++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/CastManager.kt
-@@ -18,6 +18,13 @@ import com.margelo.nitro.queueplayer.cast.CastSinkRouter
+@@ -18,6 +18,14 @@ import com.margelo.nitro.queueplayer.cast.CastSinkRouter
  import com.margelo.nitro.queueplayer.cast.PlaybackStateRouter
  import com.margelo.nitro.queueplayer.cast.chromecast.ChromecastSession as RoutedChromecastSession
  import com.margelo.nitro.queueplayer.cast.CastSession as RoutedCastSession
@@ -655,13 +655,14 @@ index 9d6e216..30d0680 100644
 +import com.margelo.nitro.queueplayer.cast.airplay.MulticastLockHolder
 +import com.margelo.nitro.queueplayer.cast.direct.CastMdnsScanner
 +import com.margelo.nitro.queueplayer.cast.direct.DirectCastReceivers
-+import com.margelo.nitro.queueplayer.cast.direct.DirectCastSession
 +import com.margelo.nitro.queueplayer.cast.direct.DirectCastTarget
++import com.margelo.nitro.queueplayer.cast.direct.LeasedQueuePlayer
 +import com.margelo.nitro.queueplayer.cast.direct.openDirectCastSession
++import com.margelo.nitro.queueplayer.cast.direct.openMpdSession
  import com.margelo.nitro.queueplayer.cast.airplay.AirPlay2JNI
  import com.margelo.nitro.queueplayer.cast.airplay.AirPlayBackend
  import com.margelo.nitro.queueplayer.cast.airplay.AirPlayReceiverMapper
-@@ -98,6 +105,23 @@ class CastManager : HybridCastManagerSpec() {
+@@ -98,6 +106,23 @@ class CastManager : HybridCastManagerSpec() {
    @Volatile
    private var airplayReceivers: List<CastReceiver> = emptyList()
  
@@ -685,16 +686,17 @@ index 9d6e216..30d0680 100644
    @Volatile
    private var receiversSnapshot: Array<CastReceiver> = emptyArray()
  
-@@ -107,6 +131,8 @@ class CastManager : HybridCastManagerSpec() {
+@@ -107,6 +132,9 @@ class CastManager : HybridCastManagerSpec() {
    // drain thread without a happens-before edge to the connect-thread
    // assignment.
    private val activeAirplaySession = AtomicReference<RoutedCastSession?>(null)
 +  // Self-hosted Cast receiver (certificate-pinned, no Cast SDK), if active.
-+  private val activeDirectSession = AtomicReference<DirectCastSession?>(null)
++  // Self-hosted Cast receiver or MPD server session; both drive playback here.
++  private val activeDirectSession = AtomicReference<LeasedQueuePlayer?>(null)
  
    /**
     * Active Chromecast remote-player session, set by
-@@ -189,6 +215,7 @@ class CastManager : HybridCastManagerSpec() {
+@@ -189,6 +217,7 @@ class CastManager : HybridCastManagerSpec() {
        publishReceivers()
      }
      backend.onSessionConnected = { session, deviceId ->
@@ -702,7 +704,7 @@ index 9d6e216..30d0680 100644
        // Mint the remote-player session + register with
        // PlaybackStateRouter so the transport-side shim sees the live
        // remote. The app context lets the session build its receiver-only
-@@ -302,7 +329,8 @@ class CastManager : HybridCastManagerSpec() {
+@@ -302,7 +331,8 @@ class CastManager : HybridCastManagerSpec() {
    }
  
    private fun publishReceivers() {
@@ -712,7 +714,7 @@ index 9d6e216..30d0680 100644
      receiversSnapshot = merged.toTypedArray()
      val snap = receiversSnapshot
      mainHandler.post {
-@@ -325,6 +353,7 @@ class CastManager : HybridCastManagerSpec() {
+@@ -325,6 +355,7 @@ class CastManager : HybridCastManagerSpec() {
  
    private fun installAirplaySession(session: RoutedCastSession, receiverId: String) {
      closeAirplaySession()
@@ -720,12 +722,12 @@ index 9d6e216..30d0680 100644
      activeAirplaySession.set(session)
      session.deathListener = { reason ->
        onAirplaySessionDied(receiverId, reason)
-@@ -345,6 +374,46 @@ class CastManager : HybridCastManagerSpec() {
+@@ -345,6 +376,46 @@ class CastManager : HybridCastManagerSpec() {
      }
    }
  
-+  /** Route playback to a connected self-hosted Cast receiver. Main thread. */
-+  private fun installDirectSession(session: DirectCastSession, receiverId: String, target: DirectCastTarget) {
++  /** Route playback to a connected self-hosted Cast receiver or MPD server. Main thread. */
++  private fun installDirectSession(session: LeasedQueuePlayer, receiverId: String, target: DirectCastTarget) {
 +    teardownDirectSession()
 +    activeDirectSession.set(session)
 +    PlaybackStateRouter.setActive(session)
@@ -767,7 +769,7 @@ index 9d6e216..30d0680 100644
    private fun closeAirplaySession() {
      val session = activeAirplaySession.getAndSet(null) ?: return
      session.deathListener = null
-@@ -415,6 +484,13 @@ class CastManager : HybridCastManagerSpec() {
+@@ -415,6 +486,13 @@ class CastManager : HybridCastManagerSpec() {
        airplayReceivers = receivers.map(AirPlayReceiverMapper::map)
        publishReceivers()
      }
@@ -781,7 +783,7 @@ index 9d6e216..30d0680 100644
      fireDiscoveryState()
      return Promise.resolved(Unit)
    }
-@@ -423,6 +499,13 @@ class CastManager : HybridCastManagerSpec() {
+@@ -423,6 +501,13 @@ class CastManager : HybridCastManagerSpec() {
      discoveryActive = false
      withChromecastBackend { it.stopDiscovery() }
      airplayBackend()?.stopDiscovery()
@@ -795,18 +797,20 @@ index 9d6e216..30d0680 100644
      fireDiscoveryState()
      return Promise.resolved(Unit)
    }
-@@ -444,6 +527,26 @@ class CastManager : HybridCastManagerSpec() {
+@@ -444,6 +529,28 @@ class CastManager : HybridCastManagerSpec() {
          )
          withChromecastBackend { it.connect(receiverId) }
        }
-+      receiverId.startsWith(DirectCastTarget.PREFIX) -> {
-+        val target = DirectCastTarget.parse(receiverId)
++      receiverId.startsWith(DirectCastTarget.PREFIX) || receiverId.startsWith(DirectCastTarget.MPD_PREFIX) -> {
++        val mpd = receiverId.startsWith(DirectCastTarget.MPD_PREFIX)
++        val target = DirectCastTarget.parse(receiverId, if (mpd) DirectCastTarget.MPD_PREFIX else DirectCastTarget.PREFIX)
 +        if (target == null) {
-+          promise.reject(IllegalArgumentException("Bad self-hosted Cast receiver id"))
++          promise.reject(IllegalArgumentException("Bad self-hosted receiver id"))
 +        } else {
 +          airplayScope.launch {
 +            try {
-+              val session = openDirectCastSession(context, target, options.password)
++              val session = if (mpd) openMpdSession(context, target)
++                else openDirectCastSession(context, target, options.password)
 +              mainHandler.post {
 +                closeAirplaySession()
 +                if (activeChromecastSession.get() != null) withChromecastBackend { it.disconnect() }
@@ -822,7 +826,7 @@ index 9d6e216..30d0680 100644
        receiverId.startsWith("airplay:") -> {
          val backend = airplayBackend()
          if (backend == null) {
-@@ -470,6 +573,7 @@ class CastManager : HybridCastManagerSpec() {
+@@ -470,6 +577,7 @@ class CastManager : HybridCastManagerSpec() {
  
    override fun disconnect(): Promise<Unit> {
      closeAirplaySession()
@@ -830,7 +834,7 @@ index 9d6e216..30d0680 100644
      withChromecastBackend { it.disconnect() }
      if (currentRoute.castProtocol != CastProtocol.LOCAL) {
        currentRoute = localFallbackRoute()
-@@ -493,7 +597,7 @@ class CastManager : HybridCastManagerSpec() {
+@@ -493,7 +601,7 @@ class CastManager : HybridCastManagerSpec() {
     * is active or none has been reported yet. For Chromecast this is the device
     * volume (`CastSession.volume`) observed via the session's `Cast.Listener` —
     * the same plane `setRouteVolume` writes. AirPlay receivers don't report
@@ -839,7 +843,7 @@ index 9d6e216..30d0680 100644
     */
    override fun getRouteVolume(): Double {
      val cc = activeChromecastSession.get()
-@@ -501,6 +605,8 @@ class CastManager : HybridCastManagerSpec() {
+@@ -501,6 +609,8 @@ class CastManager : HybridCastManagerSpec() {
        val v = cc.volume.value
        if (!v.isNaN()) return v.toDouble()
      }
@@ -848,7 +852,7 @@ index 9d6e216..30d0680 100644
      return Double.NaN
    }
  
-@@ -510,7 +616,8 @@ class CastManager : HybridCastManagerSpec() {
+@@ -510,7 +620,8 @@ class CastManager : HybridCastManagerSpec() {
      }
      val clamped = value.coerceIn(0.0, 1.0)
      when (currentRoute.castProtocol) {
@@ -1592,40 +1596,55 @@ index 0000000..d90b2e3
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastMdns.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastMdns.kt
 new file mode 100644
-index 0000000..8701469
+index 0000000..e786380
 --- /dev/null
 +++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastMdns.kt
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,189 @@
 +package com.margelo.nitro.queueplayer.cast.direct
 +
 +import java.net.InetAddress
 +import java.net.URLEncoder
 +
 +/**
-+ * A `_googlecast._tcp` receiver found by [CastMdnsScanner]. Self-hosted
-+ * receivers (no Google device certificate) never pass the Cast SDK's own
-+ * discovery, so the app browses for them itself and connects through
-+ * [CastChannel] with a certificate pin.
++ * A receiver found by [CastMdnsScanner]: a `_googlecast._tcp` Cast receiver or
++ * a `_mpd._tcp` Music Player Daemon. Self-hosted Cast receivers (no Google
++ * device certificate) never pass the Cast SDK's own discovery, so the app
++ * browses for them itself and connects through [CastChannel] with a
++ * certificate pin; MPD servers are driven by [MpdSession].
 + */
-+internal data class DiscoveredCast(val host: String, val port: Int, val name: String, val model: String) {
-+  /** `castdirect:<host>:<port>:<name>`, the id [DirectCastTarget.parse] reads. */
++internal data class DiscoveredCast(
++  val host: String,
++  val port: Int,
++  val name: String,
++  val model: String,
++  val kind: Kind = Kind.CAST,
++) {
++  enum class Kind(val service: String, val prefix: String) {
++    CAST("_googlecast._tcp.local", DirectCastTarget.PREFIX),
++    MPD("_mpd._tcp.local", DirectCastTarget.MPD_PREFIX),
++  }
++
++  /** `castdirect:` or `mpd:` + `<host>:<port>:<name>`, the id [DirectCastTarget.parse] reads. */
 +  val receiverId: String
-+    get() = DirectCastTarget.PREFIX + "$host:$port:" + URLEncoder.encode(name, "UTF-8").replace("+", "%20")
++    get() = kind.prefix + "$host:$port:" + URLEncoder.encode(name, "UTF-8").replace("+", "%20")
 +}
 +
-+/** The one mDNS question the scanner asks, and a minimal response parser. */
++/** The one mDNS query the scanner asks, and a minimal response parser. */
 +internal object CastMdns {
-+  const val SERVICE = "_googlecast._tcp.local"
 +  const val TYPE_A = 1
 +  const val TYPE_PTR = 12
 +  const val TYPE_TXT = 16
 +  const val TYPE_SRV = 33
 +
-+  /** A one-shot query for the [SERVICE] PTR (id 0, class IN). */
-+  fun query(): ByteArray = byteArrayOf(0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0) +
-+    SERVICE.split('.').fold(ByteArray(0)) { acc, label ->
-+      val b = label.toByteArray(Charsets.US_ASCII); acc + byteArrayOf(b.size.toByte()) + b
-+    } + byteArrayOf(0, 0, TYPE_PTR.toByte(), 0, 1)
++  /** A one-shot query for every [DiscoveredCast.Kind] service PTR (id 0, class IN). */
++  fun query(): ByteArray {
++    val kinds = DiscoveredCast.Kind.entries
++    return byteArrayOf(0, 0, 0, 0, 0, kinds.size.toByte(), 0, 0, 0, 0, 0, 0) + kinds.fold(ByteArray(0)) { acc, kind ->
++      acc + kind.service.split('.').fold(ByteArray(0)) { name, label ->
++        val b = label.toByteArray(Charsets.US_ASCII); name + byteArrayOf(b.size.toByte()) + b
++      } + byteArrayOf(0, 0, TYPE_PTR.toByte(), 0, 1)
++    }
++  }
 +
 +  class Record(val name: String, val type: Int, val ttl: Long, val data: Any)
 +  class Srv(val port: Int, val target: String)
@@ -1709,20 +1728,21 @@ index 0000000..8701469
 + * case-insensitively, so maps are keyed by the lowercased name.
 + */
 +internal class CastMdnsCollector {
-+  private class Instance(val label: String, val source: InetAddress)
++  private class Instance(val label: String, val source: InetAddress, val kind: DiscoveredCast.Kind)
 +
 +  private val instances = LinkedHashMap<String, Instance>()
 +  private val srv = HashMap<String, CastMdns.Srv>()
 +  private val txt = HashMap<String, Map<String, String>>()
 +  private val addresses = HashMap<String, String>()
 +  private val gone = HashSet<String>() // said goodbye (PTR TTL 0)
-+  private val suffix = "." + CastMdns.SERVICE
++
++  private fun kindOfInstance(key: String) = DiscoveredCast.Kind.entries.firstOrNull { key.endsWith("." + it.service) }
 +
 +  fun add(packet: ByteArray, source: InetAddress) {
 +    for (r in CastMdns.parse(packet)) {
 +      val key = r.name.lowercase()
 +      when (r.type) {
-+        CastMdns.TYPE_PTR -> if (key == CastMdns.SERVICE) {
++        CastMdns.TYPE_PTR -> if (DiscoveredCast.Kind.entries.any { it.service == key }) {
 +          val instance = r.data as String
 +          if (r.ttl == 0L) {
 +            gone += instance.lowercase()
@@ -1732,7 +1752,7 @@ index 0000000..8701469
 +            track(instance, source, replace = false)
 +          }
 +        }
-+        CastMdns.TYPE_SRV -> if (key.endsWith(suffix)) {
++        CastMdns.TYPE_SRV -> if (kindOfInstance(key) != null) {
 +          srv[key] = r.data as CastMdns.Srv
 +          track(r.name, source, replace = true) // the SRV sender is the device itself
 +        }
@@ -1745,21 +1765,29 @@ index 0000000..8701469
 +
 +  private fun track(instance: String, source: InetAddress, replace: Boolean) {
 +    val key = instance.lowercase()
-+    if (!key.endsWith(suffix) || key in gone || (!replace && key in instances)) return
-+    instances[key] = Instance(instance.dropLast(suffix.length), source)
++    val kind = kindOfInstance(key) ?: return
++    if (key in gone || (!replace && key in instances)) return
++    instances[key] = Instance(instance.dropLast(kind.service.length + 1), source, kind)
 +  }
 +
 +  fun receivers(): List<DiscoveredCast> = instances.mapNotNull { (key, instance) ->
 +    val service = srv[key] ?: return@mapNotNull null
 +    val props = txt[key].orEmpty()
-+    val name = props["fn"]?.takeIf { it.isNotBlank() } ?: instance.label
++    // avahi names an MPD server "Music Player @ host[pid]"; the pid changes on restart.
++    val label = if (instance.kind == DiscoveredCast.Kind.MPD) instance.label.replace(PID_SUFFIX, "") else instance.label
++    val name = props["fn"]?.takeIf { it.isNotBlank() } ?: label
 +    DiscoveredCast(
 +      host = addresses[service.target.lowercase()] ?: instance.source.hostAddress ?: return@mapNotNull null,
 +      port = service.port,
 +      name = name.filterNot { it.isISOControl() }.take(128),
 +      model = props["md"].orEmpty(),
++      kind = instance.kind,
 +    )
 +  }.distinctBy { it.receiverId }
++
++  private companion object {
++    val PID_SUFFIX = Regex("""\[\d+]$""")
++  }
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastMdnsScanner.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/CastMdnsScanner.kt
 new file mode 100644
@@ -1995,10 +2023,10 @@ index 0000000..0cdc770
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCast.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCast.kt
 new file mode 100644
-index 0000000..c5aa15b
+index 0000000..ad372dd
 --- /dev/null
 +++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCast.kt
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,70 @@
 +package com.margelo.nitro.queueplayer.cast.direct
 +
 +import android.content.Context
@@ -2007,17 +2035,18 @@ index 0000000..c5aa15b
 +import java.net.URLDecoder
 +
 +/**
-+ * A manually configured self-hosted Cast receiver, addressed by receiver id
-+ * `castdirect:<host>:<port>[:<url-encoded name>]`. The certificate pin travels
-+ * separately as the connect password.
++ * A self-hosted Cast receiver or an MPD server, addressed by receiver id
++ * `castdirect:<host>:<port>[:<url-encoded name>]` or `mpd:…` alike. A Cast
++ * receiver's certificate pin travels separately as the connect password.
 + */
 +internal data class DirectCastTarget(val host: String, val port: Int, val name: String) {
 +  companion object {
 +    const val PREFIX = "castdirect:"
++    const val MPD_PREFIX = "mpd:"
 +
-+    fun parse(receiverId: String): DirectCastTarget? {
-+      if (!receiverId.startsWith(PREFIX)) return null
-+      val parts = receiverId.removePrefix(PREFIX).split(':', limit = 3)
++    fun parse(receiverId: String, prefix: String = PREFIX): DirectCastTarget? {
++      if (!receiverId.startsWith(prefix)) return null
++      val parts = receiverId.removePrefix(prefix).split(':', limit = 3)
 +      val host = parts.getOrNull(0)?.takeIf { it.isNotEmpty() } ?: return null
 +      val port = parts.getOrNull(1)?.toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
 +      val name = parts.getOrNull(2)?.let { runCatching { URLDecoder.decode(it, "UTF-8") }.getOrNull() }
@@ -2056,12 +2085,24 @@ index 0000000..c5aa15b
 +    throw t
 +  }
 +}
++
++/** Connect to the MPD server at [target] and start a session (blocking). */
++internal fun openMpdSession(context: Context, target: DirectCastTarget): MpdSession {
++  val client = MpdClient.connect(target.host, target.port)
++  try {
++    val leases = MediaLeaseServer(client.localAddress)
++    return MpdSession(client, leases, keepAwake = CastKeepAwake(context))
++  } catch (t: Throwable) {
++    client.close()
++    throw t
++  }
++}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastReceivers.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastReceivers.kt
 new file mode 100644
-index 0000000..a6db1f3
+index 0000000..1d20178
 --- /dev/null
 +++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastReceivers.kt
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,38 @@
 +package com.margelo.nitro.queueplayer.cast.direct
 +
 +import com.margelo.nitro.queueplayer.CastDeviceKind
@@ -2070,7 +2111,11 @@ index 0000000..a6db1f3
 +import com.margelo.nitro.queueplayer.CastReceiverCapabilities
 +import com.margelo.nitro.queueplayer.CastStreamingModel
 +
-+/** Maps [CastMdnsScanner] results onto the Nitro receiver list. */
++/**
++ * Maps [CastMdnsScanner] results onto the Nitro receiver list. MPD rows ride as
++ * CHROMECAST (pull-URL remote player, like a self-hosted Cast receiver; the
++ * Nitro enum has no MPD) and are told apart by their `mpd:` id.
++ */
 +internal object DirectCastReceivers {
 +
 +  fun map(cast: DiscoveredCast): CastReceiver = CastReceiver(
@@ -2084,7 +2129,7 @@ index 0000000..a6db1f3
 +      requiresPairing = false,
 +    ),
 +    protocolVersion = "",
-+    modelName = cast.model,
++    modelName = if (cast.kind == DiscoveredCast.Kind.MPD) "MPD" else cast.model,
 +  )
 +
 +  /**
@@ -2092,30 +2137,22 @@ index 0000000..a6db1f3
 +   * answers the mDNS scan too; its SDK row (Google device auth) wins.
 +   */
 +  fun unlisted(sdk: List<CastReceiver>, direct: List<CastReceiver>): List<CastReceiver> =
-+    direct.filter { d -> sdk.none { it.name.equals(d.name, ignoreCase = true) } }
++    direct.filter { d ->
++      d.id.startsWith(DirectCastTarget.MPD_PREFIX) || sdk.none { it.name.equals(d.name, ignoreCase = true) }
++    }
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSession.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSession.kt
 new file mode 100644
-index 0000000..66cb0c5
+index 0000000..7d642a8
 --- /dev/null
 +++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSession.kt
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,169 @@
 +package com.margelo.nitro.queueplayer.cast.direct
 +
 +import android.util.Log
-+import com.margelo.nitro.queueplayer.cast.CastMediaItem
-+import com.margelo.nitro.queueplayer.cast.CastSession
-+import com.margelo.nitro.queueplayer.cast.RemoteEndReason
 +import com.margelo.nitro.queueplayer.cast.RemoteMediaError
 +import com.margelo.nitro.queueplayer.cast.RemotePlaybackState
-+import com.margelo.nitro.queueplayer.cast.RemoteRepeatMode
 +import com.margelo.nitro.queueplayer.cast.chromecast.MediaInfoBuilder
-+import kotlinx.coroutines.flow.MutableSharedFlow
-+import kotlinx.coroutines.flow.MutableStateFlow
-+import kotlinx.coroutines.flow.SharedFlow
-+import kotlinx.coroutines.flow.StateFlow
-+import kotlinx.coroutines.flow.asSharedFlow
-+import kotlinx.coroutines.flow.asStateFlow
 +import org.json.JSONArray
 +import org.json.JSONObject
 +import java.util.concurrent.Executors
@@ -2124,8 +2161,9 @@ index 0000000..66cb0c5
 +/**
 + * Playback on a self-hosted Cast receiver through the Default Media Receiver.
 + * Such receivers take one item at a time (no QUEUE_* messages), so the queue
-+ * lives here: each track is LOADed through a [MediaLeaseServer] lease, status
-+ * is polled, and the next track is loaded when the receiver reports FINISHED.
++ * lives in [LeasedQueuePlayer]: each track is LOADed through a
++ * [MediaLeaseServer] lease, status is polled, and the next track is loaded
++ * when the receiver reports FINISHED.
 + */
 +internal class DirectCastSession(
 +  private val channel: CastChannel,
@@ -2133,39 +2171,12 @@ index 0000000..66cb0c5
 +  private val leases: MediaLeaseServer,
 +  pollMs: Long = 1_000,
 +  private val keepAwake: AutoCloseable? = null,
-+) : CastSession.RemotePlayer() {
++) : LeasedQueuePlayer("cast-direct") {
 +
-+  private val _state = MutableStateFlow(RemotePlaybackState.IDLE)
-+  private val _positionMs = MutableStateFlow(0L)
-+  private val _durationMs = MutableStateFlow(0L)
-+  private val _currentTrackIndex = MutableStateFlow(-1)
-+  private val _endedReason = MutableSharedFlow<RemoteEndReason>(extraBufferCapacity = 4)
-+  private val _mediaError = MutableSharedFlow<RemoteMediaError>(extraBufferCapacity = 4)
-+  private val _seekCompleted = MutableSharedFlow<Long>(extraBufferCapacity = 4)
-+
-+  override val state: StateFlow<RemotePlaybackState> = _state.asStateFlow()
-+  @Volatile override var hasReportedState: Boolean = false
-+  override val positionMs: StateFlow<Long> = _positionMs.asStateFlow()
-+  override val durationMs: StateFlow<Long> = _durationMs.asStateFlow()
-+  override val currentTrackIndex: StateFlow<Int> = _currentTrackIndex.asStateFlow()
-+  override val endedReason: SharedFlow<RemoteEndReason> = _endedReason.asSharedFlow()
-+  override val mediaError: SharedFlow<RemoteMediaError> = _mediaError.asSharedFlow()
-+  override val seekCompleted: SharedFlow<Long> = _seekCompleted.asSharedFlow()
-+
-+  /** Last receiver volume `0.0..1.0` (sent or reported); NaN until known. */
-+  @Volatile var volume: Float = Float.NaN
-+    private set
-+
-+  // Queue state, confined to [worker].
-+  private var queue: MutableList<CastMediaItem> = mutableListOf()
-+  private var index = -1
-+  private var repeat = RemoteRepeatMode.OFF
++  // Receiver state, confined to [worker].
 +  private var mediaSessionId: Int? = null
 +  private var loadedUrl: String? = null
-+  private var finishHandled = false
 +
-+  @Volatile private var closed = false
-+  private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "cast-direct").apply { isDaemon = true } }
 +  private val poller = Executors.newSingleThreadScheduledExecutor { r ->
 +    Thread(r, "cast-direct-poll").apply { isDaemon = true }
 +  }
@@ -2176,7 +2187,7 @@ index 0000000..66cb0c5
 +        ns == CastChannel.NS_MEDIA && payload.optString("type") == "MEDIA_STATUS" ->
 +          onWorker { applyStatus(payload) }
 +        ns == CastChannel.NS_RECEIVER && payload.optString("type") == "RECEIVER_STATUS" ->
-+          payload.optJSONObject("status")?.optJSONObject("volume")?.let { volume = it.optDouble("level").toFloat() }
++          payload.optJSONObject("status")?.optJSONObject("volume")?.let { lastVolume = it.optDouble("level").toFloat() }
 +        ns == CastChannel.NS_CONNECTION && payload.optString("type") == "CLOSE" -> receiverGone("closed")
 +      }
 +    }
@@ -2187,13 +2198,6 @@ index 0000000..66cb0c5
 +  }
 +
 +  // ---- RemotePlayer ----
-+
-+  override suspend fun load(items: List<CastMediaItem>, startIndex: Int, startPositionMs: Long, playWhenReady: Boolean) {
-+    onWorker {
-+      queue = items.toMutableList()
-+      loadIndex(startIndex.coerceIn(0, (queue.size - 1).coerceAtLeast(0)), startPositionMs, playWhenReady)
-+    }
-+  }
 +
 +  override fun play() = command("PLAY")
 +  override fun pause() = command("PAUSE")
@@ -2208,55 +2212,10 @@ index 0000000..66cb0c5
 +      ?.let { _seekCompleted.tryEmit(positionMs) }
 +  }
 +
-+  override fun queueNext() = onWorker { if (index + 1 < queue.size) loadIndex(index + 1, 0, true) }
-+  override fun queuePrev() = onWorker { if (index > 0) loadIndex(index - 1, 0, true) }
-+  override fun skipToQueueIndex(index: Int) = onWorker { if (index in queue.indices) loadIndex(index, 0, true) }
-+
-+  override suspend fun queueInsert(items: List<CastMediaItem>, beforeIndex: Int?) = onWorker {
-+    val at = beforeIndex?.coerceIn(0, queue.size) ?: queue.size
-+    queue.addAll(at, items)
-+    if (index >= 0 && at <= index) setIndex(index + items.size)
-+  }
-+
-+  override suspend fun queueRemove(indices: List<Int>) = onWorker {
-+    val removingCurrent = index in indices
-+    var newIndex = index
-+    indices.filter { it in queue.indices }.sortedDescending().forEach { i ->
-+      queue.removeAt(i)
-+      if (i < index) newIndex--
-+    }
-+    when {
-+      queue.isEmpty() -> clearPlayback()
-+      removingCurrent -> loadIndex(newIndex.coerceIn(0, queue.size - 1), 0, _state.value == RemotePlaybackState.PLAYING)
-+      else -> setIndex(newIndex)
-+    }
-+  }
-+
-+  override suspend fun queueMove(fromIndex: Int, toIndex: Int) = onWorker {
-+    if (fromIndex !in queue.indices || toIndex !in queue.indices || fromIndex == toIndex) return@onWorker
-+    queue.add(toIndex, queue.removeAt(fromIndex))
-+    setIndex(when {
-+      index == fromIndex -> toIndex
-+      fromIndex < index && toIndex >= index -> index - 1
-+      fromIndex > index && toIndex <= index -> index + 1
-+      else -> index
-+    })
-+  }
-+
-+  override suspend fun queueClear() = onWorker {
-+    queue.clear()
-+    clearPlayback()
-+  }
-+
-+  /** Receivers following the Default Media Receiver API play at 1x only. */
-+  override fun setPlaybackRate(rate: Float) = Unit
-+
-+  override fun setRepeatMode(mode: RemoteRepeatMode) = onWorker { repeat = mode }
-+
 +  override fun setVolume(value: Float) = onWorker {
 +    val level = value.coerceIn(0f, 1f)
 +    runCatching { channel.setVolume(level.toDouble()) }
-+      .onSuccess { volume = level }
++      .onSuccess { lastVolume = level }
 +      .onFailure { Log.w(TAG, "SET_VOLUME failed: ${it.message}") }
 +  }
 +
@@ -2266,7 +2225,7 @@ index 0000000..66cb0c5
 +    poller.shutdownNow()
 +    worker.execute {
 +      mediaSessionId?.let { id -> runCatching { mediaRequest(JSONObject().put("type", "STOP").put("mediaSessionId", id)) } }
-+      leases.revokeAll()
++      leases.close()
 +      channel.close()
 +      runCatching { keepAwake?.close() }
 +    }
@@ -2275,7 +2234,7 @@ index 0000000..66cb0c5
 +
 +  // ---- internals (worker thread) ----
 +
-+  private fun loadIndex(i: Int, positionMs: Long, autoplay: Boolean) {
++  override fun loadIndex(i: Int, positionMs: Long, autoplay: Boolean) {
 +    val item = queue.getOrNull(i) ?: return
 +    leases.revokeAll()
 +    val client = channel.remoteAddress
@@ -2288,7 +2247,7 @@ index 0000000..66cb0c5
 +    item.artist?.let { metadata.put("artist", it) }
 +    item.album?.let { metadata.put("albumName", it) }
 +    art?.let { metadata.put("images", JSONArray().put(JSONObject().put("url", it))) }
-+    setIndex(i)
++    updateIndex(i)
 +    loadedUrl = url
 +    finishHandled = false
 +    mediaSessionId = null
@@ -2330,35 +2289,13 @@ index 0000000..66cb0c5
 +    }
 +  }
 +
-+  private fun onTrackFinished() {
-+    if (finishHandled) return
-+    finishHandled = true
-+    val next = when {
-+      repeat == RemoteRepeatMode.SINGLE -> index
-+      index + 1 < queue.size -> index + 1
-+      repeat == RemoteRepeatMode.ALL && queue.isNotEmpty() -> 0
-+      else -> -1
-+    }
-+    if (next >= 0) {
-+      loadIndex(next, 0, true)
-+    } else {
-+      _state.value = RemotePlaybackState.ENDED
-+      _endedReason.tryEmit(RemoteEndReason.FINISHED)
-+    }
-+  }
-+
-+  private fun clearPlayback() {
++  override fun clearPlayback() {
 +    mediaSessionId?.let { id -> mediaRequest(JSONObject().put("type", "STOP").put("mediaSessionId", id)) }
 +    leases.revokeAll()
 +    mediaSessionId = null
 +    loadedUrl = null
-+    setIndex(-1)
++    updateIndex(-1)
 +    _state.value = RemotePlaybackState.IDLE
-+  }
-+
-+  private fun setIndex(i: Int) {
-+    index = i
-+    _currentTrackIndex.value = i
 +  }
 +
 +  private fun command(type: String) = onWorker {
@@ -2375,19 +2312,165 @@ index 0000000..66cb0c5
 +      ?.also { if (it.optString("type") == "MEDIA_STATUS") applyStatus(it) }
 +  }
 +
-+  private fun onWorker(block: () -> Unit) {
-+    if (worker.isShutdown) return
-+    runCatching { worker.execute { runCatching(block).onFailure { Log.w(TAG, "cast command failed", it) } } }
-+  }
-+
-+  private fun receiverGone(reason: String) {
-+    if (closed) return
-+    Log.i(TAG, "Receiver connection ended ($reason)")
-+    deathListener?.invoke(reason)
-+  }
-+
 +  private companion object {
 +    const val TAG = "DirectCastSession"
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/LeasedQueuePlayer.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/LeasedQueuePlayer.kt
+new file mode 100644
+index 0000000..1c00503
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/LeasedQueuePlayer.kt
+@@ -0,0 +1,151 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import android.util.Log
++import com.margelo.nitro.queueplayer.cast.CastMediaItem
++import com.margelo.nitro.queueplayer.cast.CastSession
++import com.margelo.nitro.queueplayer.cast.RemoteEndReason
++import com.margelo.nitro.queueplayer.cast.RemoteMediaError
++import com.margelo.nitro.queueplayer.cast.RemotePlaybackState
++import com.margelo.nitro.queueplayer.cast.RemoteRepeatMode
++import kotlinx.coroutines.flow.MutableSharedFlow
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.SharedFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asSharedFlow
++import kotlinx.coroutines.flow.asStateFlow
++import java.util.concurrent.Executors
++
++/**
++ * A remote player the app drives itself, not through the Cast SDK: a
++ * self-hosted Cast receiver ([DirectCastSession]) or an MPD server
++ * ([MpdSession]). Both play one item at a time, each fetched through a
++ * [MediaLeaseServer] lease, so the queue lives here and the next item is
++ * loaded when the device reports the current one finished. Queue state and
++ * device I/O are confined to one worker thread.
++ */
++internal abstract class LeasedQueuePlayer(private val tag: String) : CastSession.RemotePlayer() {
++
++  protected val _state = MutableStateFlow(RemotePlaybackState.IDLE)
++  protected val _positionMs = MutableStateFlow(0L)
++  protected val _durationMs = MutableStateFlow(0L)
++  private val _currentTrackIndex = MutableStateFlow(-1)
++  protected val _endedReason = MutableSharedFlow<RemoteEndReason>(extraBufferCapacity = 4)
++  protected val _mediaError = MutableSharedFlow<RemoteMediaError>(extraBufferCapacity = 4)
++  protected val _seekCompleted = MutableSharedFlow<Long>(extraBufferCapacity = 4)
++
++  override val state: StateFlow<RemotePlaybackState> = _state.asStateFlow()
++  @Volatile override var hasReportedState: Boolean = false
++  override val positionMs: StateFlow<Long> = _positionMs.asStateFlow()
++  override val durationMs: StateFlow<Long> = _durationMs.asStateFlow()
++  override val currentTrackIndex: StateFlow<Int> = _currentTrackIndex.asStateFlow()
++  override val endedReason: SharedFlow<RemoteEndReason> = _endedReason.asSharedFlow()
++  override val mediaError: SharedFlow<RemoteMediaError> = _mediaError.asSharedFlow()
++  override val seekCompleted: SharedFlow<Long> = _seekCompleted.asSharedFlow()
++
++  /** Last device volume `0.0..1.0` (sent or reported); NaN until known. */
++  val volume: Float get() = lastVolume
++  @Volatile protected var lastVolume: Float = Float.NaN
++
++  // Queue state, confined to [worker].
++  protected var queue: MutableList<CastMediaItem> = mutableListOf()
++  protected var index = -1
++  private var repeat = RemoteRepeatMode.OFF
++  /** Set once the current item's end was handled; [loadIndex] clears it. */
++  protected var finishHandled = false
++
++  @Volatile protected var closed = false
++  protected val worker = Executors.newSingleThreadExecutor { r -> Thread(r, tag).apply { isDaemon = true } }
++
++  /** Replace what the device plays with `queue[i]`, from [positionMs]. Worker thread. */
++  protected abstract fun loadIndex(i: Int, positionMs: Long, autoplay: Boolean)
++
++  /** Stop the device and forget the current item (the queue was emptied). Worker thread. */
++  protected abstract fun clearPlayback()
++
++  override suspend fun load(items: List<CastMediaItem>, startIndex: Int, startPositionMs: Long, playWhenReady: Boolean) {
++    onWorker {
++      queue = items.toMutableList()
++      loadIndex(startIndex.coerceIn(0, (queue.size - 1).coerceAtLeast(0)), startPositionMs, playWhenReady)
++    }
++  }
++
++  override fun queueNext() = onWorker { if (index + 1 < queue.size) loadIndex(index + 1, 0, true) }
++  override fun queuePrev() = onWorker { if (index > 0) loadIndex(index - 1, 0, true) }
++  override fun skipToQueueIndex(index: Int) = onWorker { if (index in queue.indices) loadIndex(index, 0, true) }
++
++  override suspend fun queueInsert(items: List<CastMediaItem>, beforeIndex: Int?) = onWorker {
++    val at = beforeIndex?.coerceIn(0, queue.size) ?: queue.size
++    queue.addAll(at, items)
++    if (index >= 0 && at <= index) updateIndex(index + items.size)
++  }
++
++  override suspend fun queueRemove(indices: List<Int>) = onWorker {
++    val removingCurrent = index in indices
++    var newIndex = index
++    indices.filter { it in queue.indices }.sortedDescending().forEach { i ->
++      queue.removeAt(i)
++      if (i < index) newIndex--
++    }
++    when {
++      queue.isEmpty() -> clearPlayback()
++      removingCurrent -> loadIndex(newIndex.coerceIn(0, queue.size - 1), 0, _state.value == RemotePlaybackState.PLAYING)
++      else -> updateIndex(newIndex)
++    }
++  }
++
++  override suspend fun queueMove(fromIndex: Int, toIndex: Int) = onWorker {
++    if (fromIndex !in queue.indices || toIndex !in queue.indices || fromIndex == toIndex) return@onWorker
++    queue.add(toIndex, queue.removeAt(fromIndex))
++    updateIndex(when {
++      index == fromIndex -> toIndex
++      fromIndex < index && toIndex >= index -> index - 1
++      fromIndex > index && toIndex <= index -> index + 1
++      else -> index
++    })
++  }
++
++  override suspend fun queueClear() = onWorker {
++    queue.clear()
++    clearPlayback()
++  }
++
++  /** Both devices play at 1x only. */
++  override fun setPlaybackRate(rate: Float) = Unit
++
++  override fun setRepeatMode(mode: RemoteRepeatMode) = onWorker { repeat = mode }
++
++  /** The current item played to its end: load the next per [repeat], or end. Worker thread. */
++  protected fun onTrackFinished() {
++    if (finishHandled) return
++    finishHandled = true
++    val next = when {
++      repeat == RemoteRepeatMode.SINGLE -> index
++      index + 1 < queue.size -> index + 1
++      repeat == RemoteRepeatMode.ALL && queue.isNotEmpty() -> 0
++      else -> -1
++    }
++    if (next >= 0) {
++      loadIndex(next, 0, true)
++    } else {
++      _state.value = RemotePlaybackState.ENDED
++      _endedReason.tryEmit(RemoteEndReason.FINISHED)
++    }
++  }
++
++  protected fun updateIndex(i: Int) {
++    index = i
++    _currentTrackIndex.value = i
++  }
++
++  protected fun onWorker(block: () -> Unit) {
++    if (worker.isShutdown) return
++    runCatching { worker.execute { runCatching(block).onFailure { Log.w(tag, "command failed", it) } } }
++  }
++
++  /** The device went away (connection closed, or another client took over). */
++  protected fun receiverGone(reason: String) {
++    if (closed) return
++    Log.i(tag, "Receiver connection ended ($reason)")
++    deathListener?.invoke(reason)
 +  }
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServer.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServer.kt
@@ -2585,6 +2668,343 @@ index 0000000..99d5032
 +  private companion object {
 +    const val TAG = "MediaLeaseServer"
 +    const val MAX_CONNECTIONS = 4
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MpdClient.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MpdClient.kt
+new file mode 100644
+index 0000000..f7517b7
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MpdClient.kt
+@@ -0,0 +1,143 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import java.io.ByteArrayOutputStream
++import java.io.IOException
++import java.net.InetAddress
++import java.net.InetSocketAddress
++import java.net.Socket
++
++internal sealed class MpdException(message: String) : IOException(message) {
++  /** Not reachable, timed out, closed, or not speaking MPD. */
++  class Connection(message: String = "MPD connection failed") : MpdException(message)
++  /** The server wants a password; none is sent (MPD passwords travel in clear text). */
++  class Permission : MpdException("MPD requires a password")
++  /** MPD's own refusal: its ACK message text. */
++  class Refused(message: String) : MpdException(message)
++}
++
++/**
++ * One Music Player Daemon control connection
++ * (<https://mpd.readthedocs.io/en/latest/protocol.html>). Arguments are
++ * quoted and control characters replaced, so track text cannot inject
++ * commands; replies are bounded in line length and pair count.
++ */
++internal class MpdClient private constructor(private val socket: Socket) : AutoCloseable {
++
++  /** The parts of MPD's `status` reply a session follows. */
++  data class Status(
++    val state: String,
++    val songId: Int?,
++    val elapsedMs: Long?,
++    val durationMs: Long?,
++    /** 0..100, or null when the output has no mixer. */
++    val volume: Int?,
++    val error: String?,
++  )
++
++  private val input = socket.getInputStream().buffered()
++  private val output = socket.getOutputStream()
++
++  val version: String = line().let { greeting ->
++    if (!greeting.startsWith("OK MPD ")) throw MpdException.Connection("Not an MPD server")
++    greeting.removePrefix("OK MPD ")
++  }
++  val localAddress: InetAddress get() = socket.localAddress
++  val remoteAddress: InetAddress get() = socket.inetAddress
++
++  /** Sends one command with quoted [args]; returns its `key: value` reply pairs. */
++  @Synchronized
++  fun command(name: String, vararg args: String): List<Pair<String, String>> {
++    val request = StringBuilder(name)
++    for (arg in args) {
++      request.append(" \"")
++      for (c in arg) {
++        when {
++          c == '"' || c == '\\' -> request.append('\\').append(c)
++          c.isISOControl() -> request.append(' ') // a newline would end the command and start another
++          else -> request.append(c)
++        }
++      }
++      request.append('"')
++    }
++    request.append('\n')
++    try {
++      output.write(request.toString().toByteArray(Charsets.UTF_8))
++      output.flush()
++    } catch (e: IOException) {
++      throw MpdException.Connection(e.message ?: "write failed")
++    }
++    val pairs = mutableListOf<Pair<String, String>>()
++    while (true) {
++      val line = line()
++      if (line == "OK") return pairs
++      if (line.startsWith("ACK ")) {
++        // ACK [error@command_listNum] {current_command} message_text
++        val code = line.removePrefix("ACK [").substringBefore('@')
++        if (code == "4") throw MpdException.Permission()
++        throw MpdException.Refused(line.substringAfter("} ", "").take(200))
++      }
++      val colon = line.indexOf(": ")
++      if (colon <= 0) throw MpdException.Connection("Malformed MPD reply")
++      if (pairs.size < 256) pairs += line.substring(0, colon) to line.substring(colon + 2)
++    }
++  }
++
++  fun status(): Status {
++    val pairs = command("status").toMap()
++    return Status(
++      state = pairs["state"].orEmpty(),
++      songId = pairs["songid"]?.toIntOrNull(),
++      elapsedMs = pairs["elapsed"].seconds(),
++      durationMs = pairs["duration"].seconds(),
++      volume = pairs["volume"]?.toIntOrNull()?.takeIf { it in 0..100 },
++      error = pairs["error"],
++    )
++  }
++
++  override fun close() {
++    runCatching { socket.close() }
++  }
++
++  private fun String?.seconds(): Long? =
++    this?.toDoubleOrNull()?.takeIf { it.isFinite() && it in 0.0..86_400.0 }?.let { (it * 1000).toLong() }
++
++  /** One reply line without its newline; a peer streaming without newlines is refused. */
++  private fun line(): String {
++    val bytes = ByteArrayOutputStream()
++    try {
++      while (true) {
++        val b = input.read()
++        if (b < 0) throw MpdException.Connection("MPD closed the connection")
++        if (b == '\n'.code) break
++        if (bytes.size() >= MAX_LINE) throw MpdException.Connection("MPD reply line too long")
++        bytes.write(b)
++      }
++    } catch (e: MpdException) {
++      throw e
++    } catch (e: IOException) {
++      throw MpdException.Connection(e.message ?: "read failed")
++    }
++    return bytes.toString(Charsets.UTF_8.name()).trimEnd('\r')
++  }
++
++  companion object {
++    private const val MAX_LINE = 8192
++
++    /** Connect and read the greeting. Each reply must come within [timeoutMs]. */
++    fun connect(host: String, port: Int, timeoutMs: Int = 5_000): MpdClient {
++      val socket = Socket()
++      try {
++        socket.connect(InetSocketAddress(host, port), timeoutMs)
++        socket.soTimeout = timeoutMs
++        socket.tcpNoDelay = true
++        return MpdClient(socket)
++      } catch (e: MpdException) {
++        socket.close()
++        throw e
++      } catch (e: IOException) {
++        socket.close()
++        throw MpdException.Connection(e.message ?: "connect failed")
++      }
++    }
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MpdSession.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MpdSession.kt
+new file mode 100644
+index 0000000..ec45768
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MpdSession.kt
+@@ -0,0 +1,182 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import android.util.Log
++import com.margelo.nitro.queueplayer.cast.RemoteMediaError
++import com.margelo.nitro.queueplayer.cast.RemotePlaybackState
++import java.util.Locale
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++import kotlin.math.roundToInt
++
++/**
++ * Playback on a Music Player Daemon. MPD cannot take a live stream, so each
++ * track is a [MediaLeaseServer] lease that only the MPD host may fetch; MPD's
++ * curl input fetches and decodes the original. Loading replaces MPD's queue
++ * with that one song (`clear`, `addid`, `playid`); `status` is polled for
++ * position, pause and end. MPD stopping after our song started is its natural
++ * end. Another client's song is a takeover, never an end: the session reports
++ * the receiver gone.
++ */
++internal class MpdSession(
++  private val client: MpdClient,
++  private val leases: MediaLeaseServer,
++  pollMs: Long = 1_000,
++  private val keepAwake: AutoCloseable? = null,
++) : LeasedQueuePlayer("mpd") {
++
++  // Device state, confined to [worker].
++  /** MPD's id for the song we queued; null when nothing of ours is loaded. */
++  private var songId: Int? = null
++  /** Our song reached play or pause, so a later `stop` is its end. */
++  private var started = false
++  private var errorReported = false
++
++  private val poller = Executors.newSingleThreadScheduledExecutor { r ->
++    Thread(r, "mpd-poll").apply { isDaemon = true }
++  }
++
++  init {
++    poller.scheduleWithFixedDelay({ onWorker { if (songId != null) refresh() } }, pollMs, pollMs, TimeUnit.MILLISECONDS)
++  }
++
++  // ---- RemotePlayer ----
++
++  override fun play() = onWorker { if (songId != null && mpd { command("pause", "0") }) refresh() }
++  override fun pause() = onWorker { if (songId != null && mpd { command("pause", "1") }) refresh() }
++  override fun stop() = onWorker { if (songId != null && mpd { command("stop") }) refresh() }
++
++  override fun seekTo(positionMs: Long) = onWorker {
++    if (songId == null) return@onWorker
++    if (seek(positionMs)) _seekCompleted.tryEmit(positionMs)
++    refresh()
++  }
++
++  override fun setVolume(value: Float) = onWorker {
++    val level = value.coerceIn(0f, 1f)
++    try {
++      client.command("setvol", (level * 100).roundToInt().toString())
++      lastVolume = level
++    } catch (e: MpdException.Connection) {
++      receiverGone("network")
++    } catch (e: MpdException) {
++      Log.w(TAG, "setvol refused: ${e.message}") // an output without a mixer; playback still works
++    }
++  }
++
++  override fun close() {
++    if (closed) return
++    closed = true
++    poller.shutdownNow()
++    worker.execute {
++      songId?.let { id ->
++        runCatching { client.command("stop") }
++        runCatching { client.command("deleteid", id.toString()) }
++      }
++      leases.close()
++      client.close()
++      runCatching { keepAwake?.close() }
++    }
++    worker.shutdown()
++  }
++
++  // ---- internals (worker thread) ----
++
++  override fun loadIndex(i: Int, positionMs: Long, autoplay: Boolean) {
++    val item = queue.getOrNull(i) ?: return
++    leases.revokeAll()
++    val url = leases.lease(item.uri.toString(), item.headers.orEmpty(), item.contentType, client.remoteAddress)
++    updateIndex(i)
++    finishHandled = false
++    started = false
++    errorReported = false
++    songId = null
++    _state.value = RemotePlaybackState.LOADING
++    _positionMs.value = positionMs
++    _durationMs.value = item.durationMs ?: 0L
++    val loaded = mpd {
++      command("clearerror")
++      command("clear")
++      val id = command("addid", url).firstOrNull { it.first == "Id" }?.second?.toIntOrNull()
++        ?: throw MpdException.Refused("addid returned no id")
++      songId = id
++      // Text for MPD clients showing what plays; older servers may refuse it.
++      for ((tag, value) in listOf("Title" to item.title, "Artist" to item.artist, "Album" to item.album)) {
++        if (!value.isNullOrEmpty()) runCatching { command("addtagid", id.toString(), tag, value) }
++      }
++      command("playid", id.toString())
++    }
++    if (!loaded) {
++      if (!closed) fail("MPD did not load the track")
++      return
++    }
++    if (positionMs > 0) seek(positionMs)
++    if (!autoplay) mpd { command("pause", "1") }
++    refresh()
++  }
++
++  override fun clearPlayback() {
++    songId?.let { id -> mpd { command("stop"); command("deleteid", id.toString()) } }
++    leases.revokeAll()
++    songId = null
++    updateIndex(-1)
++    _state.value = RemotePlaybackState.IDLE
++  }
++
++  /** `seekcur`; false when MPD refuses (a source without byte ranges keeps playing). */
++  private fun seek(positionMs: Long): Boolean =
++    mpd { command("seekcur", String.format(Locale.US, "%.3f", positionMs / 1000.0)) }
++
++  private fun refresh() {
++    val ours = songId ?: return
++    val status = try {
++      client.status()
++    } catch (e: MpdException.Connection) {
++      receiverGone("network")
++      return
++    } catch (e: MpdException) {
++      fail(e.message ?: "MPD refused status")
++      return
++    }
++    hasReportedState = true
++    status.volume?.let { lastVolume = it / 100f }
++    if (status.error != null) {
++      fail("MPD could not play the track: ${status.error}")
++      return
++    }
++    if (status.songId != null && status.songId != ours) {
++      receiverGone("takeover")
++      return
++    }
++    status.elapsedMs?.let { _positionMs.value = it }
++    status.durationMs?.takeIf { it > 0 }?.let { _durationMs.value = it }
++    when (status.state) {
++      "play" -> { started = true; _state.value = RemotePlaybackState.PLAYING }
++      "pause" -> { started = true; _state.value = RemotePlaybackState.PAUSED }
++      "stop" -> if (started) onTrackFinished()
++    }
++  }
++
++  private fun fail(message: String) {
++    _state.value = RemotePlaybackState.ERROR
++    if (!errorReported) {
++      errorReported = true
++      _mediaError.tryEmit(RemoteMediaError(-1, message))
++    }
++  }
++
++  /** Runs MPD commands; false on a refusal, and a lost connection reports the receiver gone. */
++  private inline fun mpd(block: MpdClient.() -> Unit): Boolean = try {
++    client.block()
++    true
++  } catch (e: MpdException.Connection) {
++    receiverGone("network")
++    false
++  } catch (e: MpdException) {
++    Log.w(TAG, "MPD refused: ${e.message}")
++    false
++  }
++
++  private companion object {
++    const val TAG = "MpdSession"
 +  }
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayAp1CryptoTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayAp1CryptoTest.kt
@@ -2818,10 +3238,10 @@ index 0000000..4790e9d
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastMdnsTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastMdnsTest.kt
 new file mode 100644
-index 0000000..41831f6
+index 0000000..68cf97e
 --- /dev/null
 +++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/CastMdnsTest.kt
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,147 @@
 +package com.margelo.nitro.queueplayer.cast.direct
 +
 +import org.junit.Assert.assertArrayEquals
@@ -2878,10 +3298,35 @@ index 0000000..41831f6
 +  private val source = InetAddress.getByName("192.168.1.40")
 +
 +  @Test
-+  fun `query asks once for the googlecast PTR`() {
-+    val expected = byteArrayOf(0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0) +
-+      MdnsPacket.name("_googlecast._tcp.local") + byteArrayOf(0, 12, 0, 1)
++  fun `query asks for the googlecast and mpd PTRs`() {
++    val expected = byteArrayOf(0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0) +
++      MdnsPacket.name("_googlecast._tcp.local") + byteArrayOf(0, 12, 0, 1) +
++      MdnsPacket.name("_mpd._tcp.local") + byteArrayOf(0, 12, 0, 1)
 +    assertArrayEquals(expected, CastMdns.query())
++  }
++
++  @Test
++  fun `resolves an MPD server, without the process id avahi appends to its name`() {
++    val collector = CastMdnsCollector()
++    collector.add(MdnsPacket()
++      .ptr("_mpd._tcp.local", "Music Player @ alex-garage[9246]._mpd._tcp.local")
++      .srv("Music Player @ alex-garage[9246]._mpd._tcp.local", 6600, "alex-garage.local")
++      .a("alex-garage.local", "192.168.1.17").bytes(), source)
++    val mpd = collector.receivers().single()
++    assertEquals(DiscoveredCast("192.168.1.17", 6600, "Music Player @ alex-garage", "", DiscoveredCast.Kind.MPD), mpd)
++    assertEquals("mpd:192.168.1.17:6600:Music%20Player%20%40%20alex-garage", mpd.receiverId)
++    assertEquals(DirectCastTarget("192.168.1.17", 6600, "Music Player @ alex-garage"),
++      DirectCastTarget.parse(mpd.receiverId, DirectCastTarget.MPD_PREFIX))
++  }
++
++  @Test
++  fun `the same host can offer both a Cast receiver and MPD`() {
++    val collector = CastMdnsCollector()
++    collector.add(MdnsPacket.pi().bytes(), source)
++    collector.add(MdnsPacket()
++      .ptr("_mpd._tcp.local", "Music Player @ raspberrypi._mpd._tcp.local")
++      .srv("Music Player @ raspberrypi._mpd._tcp.local", 6600, "raspberrypi.local").bytes(), source)
++    assertEquals(listOf(DiscoveredCast.Kind.CAST, DiscoveredCast.Kind.MPD), collector.receivers().map { it.kind })
 +  }
 +
 +  @Test
@@ -2928,7 +3373,8 @@ index 0000000..41831f6
 +  @Test
 +  fun `ignores other services and survives malformed packets`() {
 +    val collector = CastMdnsCollector()
-+    collector.add(MdnsPacket().ptr("_raop._tcp.local", "x._raop._tcp.local").bytes(), source)
++    collector.add(MdnsPacket().ptr("_raop._tcp.local", "x._raop._tcp.local")
++      .srv("x._raop._tcp.local", 7000, "x.local").bytes(), source)
 +    collector.add(byteArrayOf(1, 2, 3), source)
 +    collector.add(MdnsPacket.pi().bytes().copyOf(40), source) // truncated
 +    val loop = byteArrayOf(0, 0, 0x84.toByte(), 0, 0, 0, 0, 1, 0, 0, 0, 0, 0xC0.toByte(), 12) // pointer to itself
@@ -3052,10 +3498,10 @@ index 0000000..3171aaf
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastReceiversTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastReceiversTest.kt
 new file mode 100644
-index 0000000..d8a4001
+index 0000000..1f24715
 --- /dev/null
 +++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastReceiversTest.kt
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,50 @@
 +package com.margelo.nitro.queueplayer.cast.direct
 +
 +import com.margelo.nitro.queueplayer.CastDeviceKind
@@ -3088,19 +3534,30 @@ index 0000000..d8a4001
 +  }
 +
 +  @Test
++  fun `maps an MPD server to an mpd row`() {
++    val row = DirectCastReceivers.map(DiscoveredCast("192.168.1.17", 6600, "Music Player @ alex-garage", "", DiscoveredCast.Kind.MPD))
++    assertEquals("mpd:192.168.1.17:6600:Music%20Player%20%40%20alex-garage", row.id)
++    assertEquals("MPD", row.modelName)
++    assertEquals(CastStreamingModel.PULLURL, row.capabilities.streamingModel)
++  }
++
++  @Test
 +  fun `drops a direct row the Cast SDK already lists by name`() {
 +    val real = DirectCastReceivers.map(DiscoveredCast("192.168.1.50", 8009, "Living Room TV", "Chromecast"))
 +    val direct = listOf(real, DirectCastReceivers.map(garage))
 +    assertEquals(listOf("Garage Cast"), DirectCastReceivers.unlisted(listOf(sdk("living room tv")), direct).map { it.name })
 +    assertEquals(2, DirectCastReceivers.unlisted(emptyList(), direct).size)
++    // MPD rows never collide with a Cast SDK device of the same name.
++    val mpd = DirectCastReceivers.map(DiscoveredCast("192.168.1.50", 6600, "Living Room TV", "", DiscoveredCast.Kind.MPD))
++    assertEquals(listOf(mpd), DirectCastReceivers.unlisted(listOf(sdk("Living Room TV")), listOf(mpd)))
 +  }
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSessionTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSessionTest.kt
 new file mode 100644
-index 0000000..34b10ea
+index 0000000..2a96140
 --- /dev/null
 +++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastSessionTest.kt
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,150 @@
 +package com.margelo.nitro.queueplayer.cast.direct
 +
 +import android.net.Uri
@@ -3240,6 +3697,15 @@ index 0000000..34b10ea
 +    receiver.close()
 +    receiver.dropClients()
 +    assertTrue(died.await(3, TimeUnit.SECONDS))
++  }
++
++  @Test
++  fun `close shuts the lease server down`() = runBlocking {
++    session.load(tracks, 0, 0, true)
++    waitFor("LOAD") { receiver.contentId != null }
++    val port = java.net.URI(receiver.contentId!!).port
++    session.close()
++    waitFor("lease server closed") { runCatching { java.net.Socket("127.0.0.1", port).close() }.isFailure }
 +  }
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastTargetTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastTargetTest.kt
@@ -3431,6 +3897,115 @@ index 0000000..5ce01da
 +    const val MEDIA = "urn:x-cast:com.google.cast.media"
 +  }
 +}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/FakeMpdServer.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/FakeMpdServer.kt
+new file mode 100644
+index 0000000..4379e8d
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/FakeMpdServer.kt
+@@ -0,0 +1,103 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import java.io.BufferedReader
++import java.io.InputStreamReader
++import java.net.InetAddress
++import java.net.ServerSocket
++import java.net.Socket
++import java.util.concurrent.CopyOnWriteArrayList
++
++/**
++ * A scripted Music Player Daemon on localhost: one client at a time, the
++ * commands MpdSession sends, and a status the test can steer.
++ */
++internal class FakeMpdServer(
++  private val greeting: String = "OK MPD 0.24.0",
++  /** Answer every command with ACK [4@0] (password required). */
++  @Volatile var requirePassword: Boolean = false,
++) : AutoCloseable {
++  private val server = ServerSocket(0, 4, InetAddress.getLoopbackAddress())
++  val port: Int get() = server.localPort
++
++  /** Every command line received, as sent. */
++  val received = CopyOnWriteArrayList<String>()
++
++  @Volatile var state = "stop"
++  @Volatile var songId: Int? = null
++  @Volatile var elapsed = 0.0
++  @Volatile var duration: Double? = null
++  @Volatile var volume = 70
++  @Volatile var error: String? = null
++  @Volatile var hasMixer = true
++  @Volatile var refuseSeek = false
++  @Volatile private var nextId = 1
++  /** URLs added with addid, by song id. */
++  val queue = java.util.concurrent.ConcurrentHashMap<Int, String>()
++  @Volatile private var client: Socket? = null
++
++  private val thread = Thread {
++    while (!server.isClosed) {
++      val socket = runCatching { server.accept() }.getOrNull() ?: break
++      client = socket
++      runCatching { serve(socket) }
++      runCatching { socket.close() }
++    }
++  }.apply { isDaemon = true; start() }
++
++  /** The song plays to its end: MPD stops (single-song queue). */
++  fun finish() {
++    state = "stop"
++    songId = null
++    elapsed = 0.0
++  }
++
++  /** Another client replaced the queue and plays its own song. */
++  fun takeover() {
++    songId = 999
++    state = "play"
++  }
++
++  /** Drop the control connection, as when MPD restarts. */
++  fun disconnect() {
++    runCatching { client?.close() }
++  }
++
++  private fun serve(socket: Socket) {
++    val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
++    val out = socket.getOutputStream()
++    fun send(text: String) { out.write(text.toByteArray(Charsets.UTF_8)); out.flush() }
++    send("$greeting\n")
++    while (true) {
++      val line = reader.readLine() ?: return
++      received += line
++      if (requirePassword) { send("ACK [4@0] {${line.substringBefore(' ')}} you don't have permission\n"); continue }
++      val args = Regex("\"((?:\\\\.|[^\"\\\\])*)\"").findAll(line).map { it.groupValues[1].replace(Regex("\\\\(.)"), "$1") }.toList()
++      when (line.substringBefore(' ')) {
++        "status" -> send(buildString {
++          append("volume: ${if (hasMixer) volume else -1}\n")
++          append("state: $state\n")
++          songId?.let { append("song: 0\nsongid: $it\n") }
++          if (songId != null) append("elapsed: $elapsed\n")
++          duration?.let { if (songId != null) append("duration: $it\n") }
++          error?.let { append("error: $it\n") }
++          append("OK\n")
++        })
++        "addid" -> { val id = nextId++; queue[id] = args[0]; send("Id: $id\nOK\n") }
++        "playid" -> { songId = args[0].toInt(); state = "play"; elapsed = 0.0; send("OK\n") }
++        "pause" -> { state = if (args[0] == "1") "pause" else "play"; send("OK\n") }
++        "seekcur" -> if (refuseSeek) send("ACK [2@0] {seekcur} Not seekable\n") else { elapsed = args[0].toDouble(); send("OK\n") }
++        "setvol" -> if (hasMixer) { volume = args[0].toInt(); send("OK\n") } else send("ACK [52@0] {setvol} No mixer\n")
++        "clear" -> { queue.clear(); songId = null; state = "stop"; send("OK\n") }
++        "stop" -> { state = "stop"; send("OK\n") }
++        "clearerror" -> { error = null; send("OK\n") }
++        "deleteid", "addtagid" -> send("OK\n")
++        else -> send("ACK [5@0] {} unknown command\n")
++      }
++    }
++  }
++
++  override fun close() {
++    runCatching { server.close() }
++    runCatching { client?.close() }
++  }
++}
 diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServerTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServerTest.kt
 new file mode 100644
 index 0000000..2296f85
@@ -3551,6 +4126,251 @@ index 0000000..2296f85
 +    assertEquals("bytes 100-199/10000", headers["Content-Range"])
 +    assertArrayEquals(audio.copyOfRange(100, 200), body)
 +    assertArrayEquals(audio, fetch(url).third)
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MpdClientTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MpdClientTest.kt
+new file mode 100644
+index 0000000..2bddbeb
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MpdClientTest.kt
+@@ -0,0 +1,60 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertThrows
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class MpdClientTest {
++
++  private val server = FakeMpdServer()
++
++  @After
++  fun tearDown() = server.close()
++
++  @Test
++  fun `reads the greeting and key-value replies`() {
++    MpdClient.connect("127.0.0.1", server.port).use { mpd ->
++      assertEquals("0.24.0", mpd.version)
++      server.state = "pause"; server.songId = 3; server.elapsed = 12.5; server.duration = 200.0
++      val status = mpd.status()
++      assertEquals(MpdClient.Status(state = "pause", songId = 3, elapsedMs = 12_500, durationMs = 200_000, volume = 70, error = null), status)
++    }
++  }
++
++  @Test
++  fun `quotes arguments so track text cannot inject commands`() {
++    MpdClient.connect("127.0.0.1", server.port).use { mpd ->
++      mpd.command("addtagid", "1", "Title", "Say \"hi\"\nclear\\")
++    }
++    assertEquals("addtagid \"1\" \"Title\" \"Say \\\"hi\\\" clear\\\\\"", server.received.last())
++  }
++
++  @Test
++  fun `maps ACKs to permission and refusal errors`() {
++    MpdClient.connect("127.0.0.1", server.port).use { mpd ->
++      val refused = assertThrows(MpdException.Refused::class.java) { mpd.command("bogus") }
++      assertEquals("unknown command", refused.message)
++      server.requirePassword = true
++      assertThrows(MpdException.Permission::class.java) { mpd.status() }
++    }
++  }
++
++  @Test
++  fun `refuses a server that does not greet as MPD`() {
++    FakeMpdServer(greeting = "HTTP/1.1 400 Bad Request").use { other ->
++      assertThrows(MpdException.Connection::class.java) { MpdClient.connect("127.0.0.1", other.port) }
++    }
++  }
++
++  @Test
++  fun `a dropped connection is a connection error`() {
++    MpdClient.connect("127.0.0.1", server.port).use { mpd ->
++      mpd.status()
++      server.close()
++      val error = runCatching { repeat(3) { mpd.status() } }.exceptionOrNull()
++      assertTrue(error.toString(), error is MpdException.Connection)
++    }
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MpdSessionTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MpdSessionTest.kt
+new file mode 100644
+index 0000000..1dfc933
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MpdSessionTest.kt
+@@ -0,0 +1,173 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import android.net.Uri
++import com.margelo.nitro.queueplayer.cast.CastMediaItem
++import com.margelo.nitro.queueplayer.cast.RemoteEndReason
++import com.margelo.nitro.queueplayer.cast.RemotePlaybackState
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import java.net.InetAddress
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++class MpdSessionTest {
++
++  private val mpd = FakeMpdServer()
++  private val leases = MediaLeaseServer(InetAddress.getByName("127.0.0.1"))
++  private val session = MpdSession(MpdClient.connect("127.0.0.1", mpd.port), leases, pollMs = 100)
++
++  private val tracks = listOf("a", "b").map {
++    CastMediaItem(uri = Uri.parse("https://music.example/rest/stream?id=$it&t=secret"), title = "Song $it", artist = "Band", album = "LP")
++  }
++
++  @After
++  fun tearDown() {
++    session.close()
++    leases.close()
++    mpd.close()
++  }
++
++  private fun waitFor(what: String, condition: () -> Boolean) {
++    val deadline = System.currentTimeMillis() + 3_000
++    while (!condition()) {
++      if (System.currentTimeMillis() > deadline) throw AssertionError("timed out waiting for $what; got ${mpd.received}")
++      Thread.sleep(20)
++    }
++  }
++
++  private fun commands() = mpd.received.filter { it != "status" }
++
++  @Test
++  fun `replaces MPD's queue with a lease of the track and labels it`() = runBlocking {
++    session.load(tracks, startIndex = 1, startPositionMs = 0, playWhenReady = true)
++    waitFor("playing") { session.state.value == RemotePlaybackState.PLAYING }
++    val url = mpd.queue.values.single()
++    assertTrue(url, url.startsWith("http://127.0.0.1:") && url.contains("/lease/"))
++    assertFalse(url.contains("secret"))
++    assertEquals(
++      listOf("clearerror", "clear", "addid \"$url\"", "addtagid \"1\" \"Title\" \"Song b\"",
++        "addtagid \"1\" \"Artist\" \"Band\"", "addtagid \"1\" \"Album\" \"LP\"", "playid \"1\""),
++      commands(),
++    )
++    assertEquals(1, session.currentTrackIndex.value)
++    assertTrue(session.hasReportedState)
++  }
++
++  @Test
++  fun `starts at the resume position and follows MPD's clock`() = runBlocking {
++    session.load(tracks, 0, startPositionMs = 30_000, playWhenReady = true)
++    waitFor("seek") { "seekcur \"30.000\"" in mpd.received }
++    mpd.elapsed = 31.5
++    waitFor("position") { session.positionMs.value == 31_500L }
++  }
++
++  @Test
++  fun `transport commands`() = runBlocking {
++    session.load(tracks, 0, 0, true)
++    waitFor("playing") { session.state.value == RemotePlaybackState.PLAYING }
++    session.pause()
++    waitFor("paused") { session.state.value == RemotePlaybackState.PAUSED }
++    session.seekTo(42_000)
++    waitFor("seek") { mpd.elapsed == 42.0 }
++    session.play()
++    waitFor("playing") { session.state.value == RemotePlaybackState.PLAYING }
++    assertEquals(listOf("pause \"1\"", "seekcur \"42.000\"", "pause \"0\""),
++      commands().filter { it.startsWith("pause") || it.startsWith("seekcur") })
++  }
++
++  @Test
++  fun `loaded paused when not playWhenReady`() = runBlocking {
++    session.load(tracks, 0, 0, playWhenReady = false)
++    waitFor("paused") { session.state.value == RemotePlaybackState.PAUSED }
++    assertTrue("pause \"1\"" in mpd.received)
++  }
++
++  @Test
++  fun `advances when MPD stops after our song, then ends`() = runBlocking {
++    val ended = CountDownLatch(1)
++    val job = launch(kotlinx.coroutines.Dispatchers.Default) { session.endedReason.collect { if (it == RemoteEndReason.FINISHED) ended.countDown() } }
++    session.load(tracks, 0, 0, true)
++    waitFor("playing a") { session.state.value == RemotePlaybackState.PLAYING }
++    mpd.finish()
++    waitFor("track b") { session.currentTrackIndex.value == 1 && mpd.songId == 2 }
++    mpd.finish()
++    assertTrue(ended.await(3, TimeUnit.SECONDS))
++    assertEquals(RemotePlaybackState.ENDED, session.state.value)
++    job.cancel()
++  }
++
++  @Test
++  fun `another client's song is a takeover, never a natural end`() = runBlocking {
++    val died = CountDownLatch(1)
++    var reason: String? = null
++    session.deathListener = { reason = it; died.countDown() }
++    session.load(tracks, 0, 0, true)
++    waitFor("playing") { session.state.value == RemotePlaybackState.PLAYING }
++    mpd.takeover()
++    assertTrue(died.await(3, TimeUnit.SECONDS))
++    assertEquals("takeover", reason)
++    assertEquals(0, session.currentTrackIndex.value)
++  }
++
++  @Test
++  fun `an MPD playback error is a media error`() = runBlocking {
++    session.load(tracks, 0, 0, true)
++    waitFor("playing") { session.state.value == RemotePlaybackState.PLAYING }
++    mpd.error = "Failed to decode"
++    waitFor("error") { session.state.value == RemotePlaybackState.ERROR }
++  }
++
++  @Test
++  fun `a dropped connection reports the receiver gone`() = runBlocking {
++    val died = CountDownLatch(1)
++    session.deathListener = { died.countDown() }
++    session.load(tracks, 0, 0, true)
++    waitFor("playing") { session.state.value == RemotePlaybackState.PLAYING }
++    mpd.close()
++    assertTrue(died.await(3, TimeUnit.SECONDS))
++  }
++
++  @Test
++  fun `volume maps to setvol and reads back, and no mixer is ignored`() = runBlocking {
++    session.load(tracks, 0, 0, true)
++    waitFor("volume read") { session.volume == 0.7f }
++    session.setVolume(0.25f)
++    waitFor("setvol") { mpd.volume == 25 }
++    mpd.hasMixer = false
++    session.setVolume(0.5f)
++    waitFor("setvol refused") { "setvol \"50\"" in mpd.received }
++    assertEquals(RemotePlaybackState.PLAYING, session.state.value)
++  }
++
++  @Test
++  fun `a source MPD cannot seek keeps playing`() = runBlocking {
++    mpd.refuseSeek = true
++    session.load(tracks, 0, 0, true)
++    waitFor("playing") { session.state.value == RemotePlaybackState.PLAYING }
++    session.seekTo(10_000)
++    waitFor("seek refused") { mpd.received.any { it.startsWith("seekcur") } }
++    Thread.sleep(250)
++    assertEquals(RemotePlaybackState.PLAYING, session.state.value)
++  }
++
++  @Test
++  fun `close stops our song and revokes leases`() = runBlocking {
++    session.load(tracks, 0, 0, true)
++    waitFor("playing") { session.state.value == RemotePlaybackState.PLAYING }
++    session.close()
++    waitFor("stop") { "deleteid \"1\"" in mpd.received }
++    assertTrue("stop" in mpd.received)
++    val port = java.net.URI(mpd.queue.values.single()).port
++    waitFor("lease server closed") { runCatching { java.net.Socket("127.0.0.1", port).close() }.isFailure }
 +  }
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/test/resources/cast/receiver.p12 b/node_modules/react-native-queue-player/android/src/test/resources/cast/receiver.p12

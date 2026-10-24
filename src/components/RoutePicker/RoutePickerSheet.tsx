@@ -13,7 +13,7 @@ import {
 import { RouteDetail } from './RouteDetail';
 import { RouteRow } from './RouteRow';
 import { type RouteInfo, type RoutePickerTheme } from './types';
-import { useRouteDiscovery } from './useRouteDiscovery';
+import { useRouteDiscovery, CAST_TRUST_REQUIRED } from './useRouteDiscovery';
 import { useRoutePickerStore } from './useRoutePickerStore';
 import { useRoutePickerTheme } from './useRoutePickerTheme';
 
@@ -123,7 +123,8 @@ function RoutePickerContent({ theme: t, onClose }: { theme: RoutePickerTheme; on
               : undefined;
           const isExpected =
             code === Cast.CastErrorCodes.AUTH_REQUIRED ||
-            code === Cast.CastErrorCodes.CONNECT_FAILED;
+            code === Cast.CastErrorCodes.CONNECT_FAILED ||
+            code === CAST_TRUST_REQUIRED;
           if (!isExpected) {
             // eslint-disable-next-line no-console
             console.warn('[RoutePicker] connect failed with unknown code', err);

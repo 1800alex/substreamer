@@ -38,11 +38,14 @@ export function rowSubtitle(route: RouteInfo, { awaitingPin = false } = {}): str
     protoBits.push(`AirPlay${route.protocolVersion ? ' ' + route.protocolVersion : ''}`);
   } else if (route.protocol === 'chromecast') {
     protoBits.push('Chromecast');
+  } else if (route.protocol === 'mpd') {
+    protoBits.push('MPD', i18n.t('routeMpdReplacesQueue'));
   } else {
     protoBits.push(route.protocol);
   }
-  if (route.modelName.length > 0) protoBits.push(route.modelName);
-  if (route.lastError) protoBits.push(i18n.t('routeCouldntConnect'));
+  if (route.modelName.length > 0 && route.protocol !== 'mpd') protoBits.push(route.modelName);
+  if (route.lastError === 'cast_trust_required') protoBits.push(i18n.t('routeNotTrustedYet'));
+  else if (route.lastError) protoBits.push(i18n.t('routeCouldntConnect'));
   return protoBits.join(' • ');
 }
 

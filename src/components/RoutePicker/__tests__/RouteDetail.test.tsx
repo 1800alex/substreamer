@@ -151,4 +151,36 @@ describe('RouteDetail pairing', () => {
     expect(onConnect).toHaveBeenCalledTimes(1);
     expect(onConnect).toHaveBeenCalledWith(r.id, 'secret', 0.5);
   });
+
+  describe('self-hosted Cast trust', () => {
+    const FP = '874a96ab4628f649e37176b35473642daf151d9f04b57bcc539d90fa81ba3824';
+    const cast = (changed: boolean) =>
+      route({
+        id: `castdirect:192.168.1.17:8009:Garage${nextId++}`,
+        protocol: 'chromecast',
+        name: 'Garage Cast',
+        modelName: '',
+        capabilities: { supportsRemoteVolume: true, streamingModel: 'pullUrl', requiresPairing: false },
+        lastError: 'cast_trust_required',
+        trust: { fingerprint: FP, changed },
+      });
+
+    it('shows the fingerprint grouped for comparing on the receiver, and trusts it on connect', () => {
+      const r = cast(false);
+      const { onConnect } = renderDetail(r);
+      expect(screen.getByText('Trust this Cast receiver?')).toBeTruthy();
+      expect(screen.getByTestId('route-detail-fingerprint')).toHaveTextContent(
+        FP.toUpperCase().match(/../g)!.join(':'),
+      );
+      fireEvent.press(screen.getByTestId('route-detail-connect'));
+      expect(onConnect).toHaveBeenCalledWith(r.id, FP, 0.5);
+      expect(screen.getByTestId('route-detail-connect')).toHaveTextContent('Trust and connect');
+    });
+
+    it('warns when a pinned receiver presents a different certificate', () => {
+      renderDetail(cast(true));
+      expect(screen.getByText('Cast receiver changed')).toBeTruthy();
+      expect(screen.getByText(/different certificate/)).toBeTruthy();
+    });
+  });
 });
