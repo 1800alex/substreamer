@@ -1,5 +1,13 @@
 # TODO
 
+## Background notifications no longer steal focus (2026-10-26)
+
+- [ ] Device check on Android 13+ with notification permission **not** granted:
+  - start a download and switch to another app; Substreamer must stay in the background;
+  - the permission prompt should appear once, when the download starts, while you are still in the app.
+- [ ] Device check with permission granted: the "Downloads in progress" notification still appears after you switch away, and clears when you return.
+- Root cause (from reading the code, not reproduced on a device): the three `use*BackgroundNotification` hooks called `requestPermissionsAsync()` on every switch to the background. On Android the dialog brings the app back to the front, and switching away dismisses it without counting as a deny, so it repeated. They now only check (`src/utils/notificationPermission.ts`). Only downloads prompt, from the foreground. Library sync and migration never prompt; they post only if permission was already granted. Covered by Jest only.
+
 ## Self-hosted Cast receivers + MPD (2026-10-24)
 
 - [ ] Device test on Android: open the route picker and check that `Garage Cast`, `rpi-mpd-office Cast` and the three `Music Player @ …` MPD servers are listed. Then check that:

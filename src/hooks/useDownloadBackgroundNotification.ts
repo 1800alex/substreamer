@@ -4,6 +4,10 @@ import { AppState, Platform } from 'react-native';
 import { useTranslation } from 'react-i18next';
 
 import { musicCacheStore } from '../store/musicCacheStore';
+import {
+  hasNotificationPermission,
+  requestNotificationPermissionInForeground,
+} from '../utils/notificationPermission';
 
 const CHANNEL_ID = 'downloads';
 
@@ -25,18 +29,34 @@ Notifications.setNotificationHandler({
   }),
 });
 
+function hasActiveDownloads(queue: { status: string }[]): boolean {
+  return queue.some((q) => q.status === 'queued' || q.status === 'downloading');
+}
+
 export function useDownloadBackgroundNotification() {
   const { t } = useTranslation();
   const notificationId = useRef<string | null>(null);
+  const askedThisSession = useRef(false);
+
+  // Starting a download is the user's own action, so that is when we ask for the
+  // permission the background notification needs, at most once per session.
+  useEffect(() => {
+    return musicCacheStore.subscribe((state, prev) => {
+      if (askedThisSession.current) return;
+      if (!hasActiveDownloads(state.downloadQueue) || hasActiveDownloads(prev.downloadQueue)) return;
+      requestNotificationPermissionInForeground()
+        .then((asked) => { if (asked) askedThisSession.current = true; })
+        .catch(() => { /* the notification is a nicety; never block downloads on it */ });
+    });
+  }, []);
 
   useEffect(() => {
     const sub = AppState.addEventListener('change', async (next) => {
-      const hasActive = musicCacheStore.getState().downloadQueue
-        .some((q) => q.status === 'queued' || q.status === 'downloading');
+      const hasActive = hasActiveDownloads(musicCacheStore.getState().downloadQueue);
 
       if (next === 'background' && hasActive) {
-        const { granted } = await Notifications.requestPermissionsAsync();
-        if (!granted) return;
+        // Check only: a prompt from here would pull the app back to the foreground.
+        if (!(await hasNotificationPermission())) return;
 
         notificationId.current = await Notifications.scheduleNotificationAsync({
           content: {

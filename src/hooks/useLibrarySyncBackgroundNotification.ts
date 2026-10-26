@@ -4,6 +4,7 @@ import { AppState, Platform } from 'react-native';
 import { useTranslation } from 'react-i18next';
 
 import { syncStatusStore } from '../store/syncStatusStore';
+import { hasNotificationPermission } from '../utils/notificationPermission';
 
 const CHANNEL_ID = 'library-sync';
 let channelEnsured = false;
@@ -42,8 +43,8 @@ export function useLibrarySyncBackgroundNotification() {
         || (st.librarySyncPhase === 'fetching' && st.albumSyncStrategy === 'basic');
 
       if (next === 'background' && isWalking) {
-        const { granted } = await Notifications.requestPermissionsAsync();
-        if (!granted) return;
+        // Check only: a prompt from here would pull the app back to the foreground.
+        if (!(await hasNotificationPermission())) return;
 
         notificationId.current = await Notifications.scheduleNotificationAsync({
           content: {

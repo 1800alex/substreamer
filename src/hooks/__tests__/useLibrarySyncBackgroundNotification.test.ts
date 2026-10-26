@@ -3,6 +3,7 @@ import { renderHook } from '@testing-library/react-native';
 const mockScheduleNotification = jest.fn(() => Promise.resolve('notif-1'));
 const mockDismissNotification = jest.fn(() => Promise.resolve());
 const mockRequestPermissions = jest.fn(() => Promise.resolve({ granted: true }));
+const mockGetPermissions = jest.fn(() => Promise.resolve({ granted: true, canAskAgain: true }));
 const mockSetNotificationChannelAsync = jest.fn(() => Promise.resolve());
 
 jest.mock('expo-notifications', () => ({
@@ -11,6 +12,7 @@ jest.mock('expo-notifications', () => ({
   scheduleNotificationAsync: (...a: unknown[]) => (mockScheduleNotification as any)(...a),
   dismissNotificationAsync: (...a: unknown[]) => (mockDismissNotification as any)(...a),
   requestPermissionsAsync: (...a: unknown[]) => (mockRequestPermissions as any)(...a),
+  getPermissionsAsync: (...a: unknown[]) => (mockGetPermissions as any)(...a),
   AndroidImportance: { LOW: 2 },
   SchedulableTriggerInputTypes: { TIME_INTERVAL: 'timeInterval' },
 }));
@@ -44,7 +46,6 @@ describe('useLibrarySyncBackgroundNotification', () => {
     syncStatusStore.setState({ detailSyncPhase: 'syncing', songSyncStrategy: 'basic' });
     renderHook(() => useLibrarySyncBackgroundNotification());
     await appStateListener!('background');
-    expect(mockRequestPermissions).toHaveBeenCalled();
     expect(mockScheduleNotification).toHaveBeenCalled();
   });
 
@@ -62,12 +63,22 @@ describe('useLibrarySyncBackgroundNotification', () => {
     expect(mockDismissNotification).toHaveBeenCalledWith('notif-1');
   });
 
-  it('skips scheduling when permissions are denied', async () => {
-    mockRequestPermissions.mockResolvedValueOnce({ granted: false });
+  it('skips scheduling when permission is not granted', async () => {
+    mockGetPermissions.mockResolvedValueOnce({ granted: false, canAskAgain: true });
     syncStatusStore.setState({ detailSyncPhase: 'syncing', songSyncStrategy: 'basic' });
     renderHook(() => useLibrarySyncBackgroundNotification());
     await appStateListener!('background');
     expect(mockScheduleNotification).not.toHaveBeenCalled();
+  });
+
+  // The Android permission dialog drags a backgrounded app back to the front, and
+  // dismissing it by switching away does not count as a denial — so asking here looped.
+  it('never prompts for permission when going to the background', async () => {
+    mockGetPermissions.mockResolvedValueOnce({ granted: false, canAskAgain: true });
+    syncStatusStore.setState({ detailSyncPhase: 'syncing', songSyncStrategy: 'basic' });
+    renderHook(() => useLibrarySyncBackgroundNotification());
+    await appStateListener!('background');
+    expect(mockRequestPermissions).not.toHaveBeenCalled();
   });
 
   it('tears down the AppState listener on unmount', () => {

@@ -4,6 +4,7 @@ import { AppState, Platform } from 'react-native';
 import { useTranslation } from 'react-i18next';
 
 import { migrationGateStore } from '../store/migrationGateStore';
+import { hasNotificationPermission } from '../utils/notificationPermission';
 
 const CHANNEL_ID = 'data-migration';
 let channelEnsured = false;
@@ -39,8 +40,8 @@ export function useMigrationGateBackgroundNotification(): void {
       const running = gate.visible && gate.mode === 'working' && !gate.failed;
 
       if (next === 'background' && running) {
-        const { granted } = await Notifications.requestPermissionsAsync();
-        if (!granted) return;
+        // Check only: a prompt from here would pull the app back to the foreground.
+        if (!(await hasNotificationPermission())) return;
         notificationId.current = await Notifications.scheduleNotificationAsync({
           content: {
             title: t('migrationPausedTitle'),
