@@ -918,7 +918,7 @@ index 52304d2..9bbf851 100644
     * Observe the active Chromecast session and bind/unbind its CastPlayer
     * onto the MediaSession. The collector runs on the main thread because
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/TrackPlayer.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/TrackPlayer.kt
-index 1c14ef0..cf3b33a 100644
+index 1c14ef0..5b62cd1 100644
 --- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/TrackPlayer.kt
 +++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/TrackPlayer.kt
 @@ -2695,7 +2695,10 @@ class TrackPlayer : HybridTrackPlayerSpec(), PlaybackEngineDelegate {
@@ -933,6 +933,19 @@ index 1c14ef0..cf3b33a 100644
      // Per-leg fresh factory for CrossfadeEngine (sharing factories
      // across two ExoPlayer instances is a documented Media3
      // anti-pattern); GaplessEngine needs only one.
+@@ -4145,6 +4148,12 @@ class TrackPlayer : HybridTrackPlayerSpec(), PlaybackEngineDelegate {
+   @VisibleForTesting
+   @MainThread
+   internal fun emitStateIfChanged() {
++    // Same rule as [getState]: once a receiver has reported it owns the state,
++    // and the cast bridge emits it. The parked local engine still fires events
++    // mid-cast; emitting them would overwrite the receiver's state in JS until
++    // the receiver next changes.
++    val remote = com.margelo.nitro.queueplayer.cast.PlaybackStateRouter.activeRemote()
++    if (remote != null && remote.hasReportedState) return
+     val computed = getStateInternal()
+     val reason = if (computed == PlayerState.BUFFERING) {
+       // Intermediate state — pass as SYSTEM and preserve the
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlay2Session.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlay2Session.kt
 index 6b65300..541765a 100644
 --- a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlay2Session.kt
@@ -2023,10 +2036,10 @@ index 0000000..0cdc770
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCast.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCast.kt
 new file mode 100644
-index 0000000..ad372dd
+index 0000000..0970903
 --- /dev/null
 +++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCast.kt
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,79 @@
 +package com.margelo.nitro.queueplayer.cast.direct
 +
 +import android.content.Context
@@ -2096,6 +2109,15 @@ index 0000000..ad372dd
 +    client.close()
 +    throw t
 +  }
++}
++
++/**
++ * Info log for the lease/MPD diagnostics. The plain-JVM tests run without
++ * android.jar's Log (it throws there), and a diagnostic must never break the
++ * request or session it describes.
++ */
++internal fun diag(tag: String, message: String) {
++  runCatching { android.util.Log.i(tag, message) }
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastReceivers.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/DirectCastReceivers.kt
 new file mode 100644
@@ -2475,10 +2497,10 @@ index 0000000..1c00503
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServer.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServer.kt
 new file mode 100644
-index 0000000..99d5032
+index 0000000..a30e39f
 --- /dev/null
 +++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServer.kt
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,197 @@
 +package com.margelo.nitro.queueplayer.cast.direct
 +
 +import android.util.Log
@@ -2562,8 +2584,10 @@ index 0000000..99d5032
 +    val path = parts.getOrNull(1) ?: return
 +    if (method != "GET" && method != "HEAD") return status(out, 405)
 +    val lease = leases[path.removePrefix("/lease/").substringBefore('?')]
-+      ?: return status(out, 404)
++      ?: return status(out, 404).also { diag(TAG, "$method from ${client.inetAddress.hostAddress}: unknown or revoked lease") }
 +    if (client.inetAddress != lease.client) return status(out, 403)
++    val started = System.currentTimeMillis()
++    diag(TAG, "$method from ${client.inetAddress.hostAddress} range=${headers["range"]}")
 +    try {
 +      if (lease.source.startsWith("file:")) {
 +        serveFile(out, File(URI(lease.source)), lease.contentType, headers["range"], method == "HEAD")
@@ -2571,8 +2595,10 @@ index 0000000..99d5032
 +        proxy(out, lease, headers["range"], method)
 +      }
 +    } catch (t: Throwable) {
-+      Log.w(TAG, "lease request failed: ${t.javaClass.simpleName}")
++      diag(TAG, "lease request failed after ${System.currentTimeMillis() - started}ms: ${t.javaClass.simpleName}: ${t.message?.substringBefore('?')}")
++      return
 +    }
++    diag(TAG, "lease request done after ${System.currentTimeMillis() - started}ms")
 +  }
 +
 +  private fun proxy(out: OutputStream, lease: Lease, range: String?, method: String) {
@@ -2584,6 +2610,7 @@ index 0000000..99d5032
 +    range?.let { conn.setRequestProperty("Range", it) }
 +    try {
 +      val code = conn.responseCode
++      diag(TAG, "upstream $code length=${conn.getHeaderField("Content-Length")} range=${conn.getHeaderField("Content-Range")}")
 +      val head = StringBuilder("HTTP/1.1 $code ${reason(code)}\r\n")
 +      val type = conn.getHeaderField("Content-Type") ?: lease.contentType
 +      type?.let { head.append("Content-Type: $it\r\n") }
@@ -2593,7 +2620,8 @@ index 0000000..99d5032
 +      head.append("Connection: close\r\n\r\n")
 +      out.write(head.toString().toByteArray(Charsets.ISO_8859_1))
 +      if (method == "GET") {
-+        (if (code < 400) conn.inputStream else conn.errorStream)?.use { it.copyTo(out) }
++        val sent = (if (code < 400) conn.inputStream else conn.errorStream)?.use { it.copyTo(out) }
++        diag(TAG, "proxied $sent bytes")
 +      }
 +      out.flush()
 +    } finally {
@@ -2821,10 +2849,10 @@ index 0000000..f7517b7
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MpdSession.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MpdSession.kt
 new file mode 100644
-index 0000000..ec45768
+index 0000000..67aea45
 --- /dev/null
 +++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MpdSession.kt
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,194 @@
 +package com.margelo.nitro.queueplayer.cast.direct
 +
 +import android.util.Log
@@ -2857,6 +2885,8 @@ index 0000000..ec45768
 +  /** Our song reached play or pause, so a later `stop` is its end. */
 +  private var started = false
 +  private var errorReported = false
++  /** Last status line logged, so the log shows only transitions. */
++  private var lastLogged: String? = null
 +
 +  private val poller = Executors.newSingleThreadScheduledExecutor { r ->
 +    Thread(r, "mpd-poll").apply { isDaemon = true }
@@ -2932,6 +2962,8 @@ index 0000000..ec45768
 +      }
 +      command("playid", id.toString())
 +    }
++    diag(TAG, "load #$i songId=$songId autoplay=$autoplay at=${positionMs}ms loaded=$loaded")
++    lastLogged = null
 +    if (!loaded) {
 +      if (!closed) fail("MPD did not load the track")
 +      return
@@ -2958,11 +2990,18 @@ index 0000000..ec45768
 +    val status = try {
 +      client.status()
 +    } catch (e: MpdException.Connection) {
++      diag(TAG, "status failed: ${e.message}")
 +      receiverGone("network")
 +      return
 +    } catch (e: MpdException) {
++      diag(TAG, "status refused: ${e.message}")
 +      fail(e.message ?: "MPD refused status")
 +      return
++    }
++    val line = "state=${status.state} songId=${status.songId} ours=$ours started=$started error=${status.error}"
++    if (line != lastLogged) {
++      lastLogged = line
++      diag(TAG, "$line elapsed=${status.elapsedMs} duration=${status.durationMs}")
 +    }
 +    hasReportedState = true
 +    status.volume?.let { lastVolume = it / 100f }
@@ -2996,6 +3035,7 @@ index 0000000..ec45768
 +    client.block()
 +    true
 +  } catch (e: MpdException.Connection) {
++    diag(TAG, "MPD connection lost: ${e.message}")
 +    receiverGone("network")
 +    false
 +  } catch (e: MpdException) {
@@ -3007,6 +3047,47 @@ index 0000000..ec45768
 +    const val TAG = "MpdSession"
 +  }
 +}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/TrackPlayerCastStateTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/TrackPlayerCastStateTest.kt
+index 924453d..bc806e3 100644
+--- a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/TrackPlayerCastStateTest.kt
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/TrackPlayerCastStateTest.kt
+@@ -114,6 +114,36 @@ class TrackPlayerCastStateTest {
+     assertEquals(PlayerState.NONE, player.getState())
+   }
+ 
++  @Test
++  fun `a local engine event during a cast session does not replace the receiver's state`() {
++    // The parked local player still fires state events mid-cast (focus,
++    // buffering). They must not reach JS: the receiver stays PLAYING and its
++    // StateFlow never re-emits, so a leaked local NONE/PAUSED would leave the
++    // play/pause button showing Play until the next track.
++    remote.reportState(RemotePlaybackState.PLAYING)
++    PlaybackStateRouter.setActive(remote)
++    val seen = mutableListOf<PlayerState>()
++    player.onStateChange { state, _ -> seen += state }
++    player.emitRemoteState(PlayerState.PLAYING, StateChangeReason.SYSTEM)
++
++    player.emitStateIfChanged()
++
++    assertEquals(listOf(PlayerState.PLAYING), seen)
++  }
++
++  @Test
++  fun `a local engine event before the receiver reports still emits the local state`() {
++    remote.backingState.value = RemotePlaybackState.PLAYING
++    PlaybackStateRouter.setActive(remote)
++    player.emitRemoteState(PlayerState.PLAYING, StateChangeReason.SYSTEM)
++    val seen = mutableListOf<PlayerState>()
++    player.onStateChange { state, _ -> seen += state }
++
++    player.emitStateIfChanged()
++
++    assertEquals(listOf(PlayerState.NONE), seen)
++  }
++
+   @Test
+   fun `reads the local player when no cast session is active`() {
+     // An unregistered session must not be consulted, however it reports.
 diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayAp1CryptoTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/airplay/AirPlayAp1CryptoTest.kt
 new file mode 100644
 index 0000000..0fbb71b
