@@ -2340,10 +2340,10 @@ index 0000000..7d642a8
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/LeasedQueuePlayer.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/LeasedQueuePlayer.kt
 new file mode 100644
-index 0000000..1c00503
+index 0000000..f7d7e2d
 --- /dev/null
 +++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/LeasedQueuePlayer.kt
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,172 @@
 +package com.margelo.nitro.queueplayer.cast.direct
 +
 +import android.util.Log
@@ -2388,6 +2388,18 @@ index 0000000..1c00503
 +  override val mediaError: SharedFlow<RemoteMediaError> = _mediaError.asSharedFlow()
 +  override val seekCompleted: SharedFlow<Long> = _seekCompleted.asSharedFlow()
 +
++  /** The queue as the receiver plays it, for [mediaSessionPlayer]. */
++  private val queueItems = MutableStateFlow<List<CastMediaItem>>(emptyList())
++
++  /**
++   * The notification / lock-screen player. Without it the MediaSession stays
++   * on the parked local player: paused, on the track playing at handoff.
++   */
++  @get:androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
++  override val mediaSessionPlayer: androidx.media3.common.Player by lazy {
++    LeasedSessionPlayer(this, queueItems.asStateFlow())
++  }
++
 +  /** Last device volume `0.0..1.0` (sent or reported); NaN until known. */
 +  val volume: Float get() = lastVolume
 +  @Volatile protected var lastVolume: Float = Float.NaN
@@ -2411,6 +2423,7 @@ index 0000000..1c00503
 +  override suspend fun load(items: List<CastMediaItem>, startIndex: Int, startPositionMs: Long, playWhenReady: Boolean) {
 +    onWorker {
 +      queue = items.toMutableList()
++      publishQueue()
 +      loadIndex(startIndex.coerceIn(0, (queue.size - 1).coerceAtLeast(0)), startPositionMs, playWhenReady)
 +    }
 +  }
@@ -2422,6 +2435,7 @@ index 0000000..1c00503
 +  override suspend fun queueInsert(items: List<CastMediaItem>, beforeIndex: Int?) = onWorker {
 +    val at = beforeIndex?.coerceIn(0, queue.size) ?: queue.size
 +    queue.addAll(at, items)
++    publishQueue()
 +    if (index >= 0 && at <= index) updateIndex(index + items.size)
 +  }
 +
@@ -2432,6 +2446,7 @@ index 0000000..1c00503
 +      queue.removeAt(i)
 +      if (i < index) newIndex--
 +    }
++    publishQueue()
 +    when {
 +      queue.isEmpty() -> clearPlayback()
 +      removingCurrent -> loadIndex(newIndex.coerceIn(0, queue.size - 1), 0, _state.value == RemotePlaybackState.PLAYING)
@@ -2442,6 +2457,7 @@ index 0000000..1c00503
 +  override suspend fun queueMove(fromIndex: Int, toIndex: Int) = onWorker {
 +    if (fromIndex !in queue.indices || toIndex !in queue.indices || fromIndex == toIndex) return@onWorker
 +    queue.add(toIndex, queue.removeAt(fromIndex))
++    publishQueue()
 +    updateIndex(when {
 +      index == fromIndex -> toIndex
 +      fromIndex < index && toIndex >= index -> index - 1
@@ -2452,6 +2468,7 @@ index 0000000..1c00503
 +
 +  override suspend fun queueClear() = onWorker {
 +    queue.clear()
++    publishQueue()
 +    clearPlayback()
 +  }
 +
@@ -2478,6 +2495,10 @@ index 0000000..1c00503
 +    }
 +  }
 +
++  private fun publishQueue() {
++    queueItems.value = queue.toList()
++  }
++
 +  protected fun updateIndex(i: Int) {
 +    index = i
 +    _currentTrackIndex.value = i
@@ -2493,6 +2514,142 @@ index 0000000..1c00503
 +    if (closed) return
 +    Log.i(tag, "Receiver connection ended ($reason)")
 +    deathListener?.invoke(reason)
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/LeasedSessionPlayer.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/LeasedSessionPlayer.kt
+new file mode 100644
+index 0000000..5206800
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/LeasedSessionPlayer.kt
+@@ -0,0 +1,130 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import android.os.Looper
++import androidx.media3.common.C
++import androidx.media3.common.MediaItem
++import androidx.media3.common.MediaMetadata
++import androidx.media3.common.Player
++import androidx.media3.common.SimpleBasePlayer
++import androidx.media3.common.util.UnstableApi
++import com.google.common.util.concurrent.Futures
++import com.google.common.util.concurrent.ListenableFuture
++import com.margelo.nitro.queueplayer.cast.CastMediaItem
++import com.margelo.nitro.queueplayer.cast.CastSession
++import com.margelo.nitro.queueplayer.cast.RemotePlaybackState
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.launch
++
++/**
++ * The MediaSession's view of a [LeasedQueuePlayer] (MPD or a self-hosted Cast
++ * receiver), so the system notification and lock screen follow the receiver
++ * instead of the parked local player. State, track and metadata come from the
++ * session's flows; play/pause/seek/skip/stop go to the receiver. Items carry
++ * no URI: the source URLs hold server credentials and controllers can read
++ * them. Main thread, like every MediaSession player.
++ */
++@UnstableApi
++internal class LeasedSessionPlayer(
++  private val remote: CastSession.RemotePlayer,
++  private val queue: StateFlow<List<CastMediaItem>>,
++) : SimpleBasePlayer(Looper.getMainLooper()) {
++
++  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
++
++  init {
++    scope.launch {
++      combine(remote.state, remote.positionMs, remote.durationMs, remote.currentTrackIndex, queue) { _, _, _, _, _ -> }
++        .collect { invalidateState() }
++    }
++  }
++
++  override fun getState(): State {
++    val items = queue.value
++    val state = remote.state.value
++    val playing = state == RemotePlaybackState.PLAYING
++    val trying = playing || state == RemotePlaybackState.BUFFERING || state == RemotePlaybackState.LOADING
++    val builder = State.Builder()
++      .setAvailableCommands(COMMANDS)
++      .setPlayWhenReady(trying, Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE)
++    if (items.isEmpty()) {
++      return builder.setPlaybackState(if (state == RemotePlaybackState.ENDED) Player.STATE_ENDED else Player.STATE_IDLE).build()
++    }
++    val index = remote.currentTrackIndex.value.coerceIn(0, items.size - 1)
++    val measured = remote.durationMs.value.takeIf { it > 0 }
++    val playlist = items.mapIndexed { i, item ->
++      val durationMs = (if (i == index) measured else null) ?: item.durationMs?.takeIf { it > 0 }
++      MediaItemData.Builder(i)
++        .setMediaItem(MediaItem.Builder().setMediaId("leased-$i").setMediaMetadata(metadata(item)).build())
++        .setDurationUs(durationMs?.let { it * 1000 } ?: C.TIME_UNSET)
++        .build()
++    }
++    val position = remote.positionMs.value
++    return builder
++      .setPlaybackState(when (state) {
++        RemotePlaybackState.PLAYING, RemotePlaybackState.PAUSED -> Player.STATE_READY
++        RemotePlaybackState.BUFFERING, RemotePlaybackState.LOADING -> Player.STATE_BUFFERING
++        RemotePlaybackState.ENDED -> Player.STATE_ENDED
++        RemotePlaybackState.IDLE, RemotePlaybackState.ERROR -> Player.STATE_IDLE
++      })
++      .setPlaylist(playlist)
++      .setCurrentMediaItemIndex(index)
++      .setContentPositionMs(
++        if (playing) PositionSupplier.getExtrapolating(position, 1f) else PositionSupplier.getConstant(position)
++      )
++      .build()
++  }
++
++  override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
++    if (playWhenReady) remote.play() else remote.pause()
++    return Futures.immediateVoidFuture()
++  }
++
++  override fun handleSeek(mediaItemIndex: Int, positionMs: Long, seekCommand: Int): ListenableFuture<*> {
++    if (seekCommand == Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM) {
++      remote.seekTo(positionMs.coerceAtLeast(0))
++    } else if (mediaItemIndex in queue.value.indices) {
++      remote.skipToQueueIndex(mediaItemIndex)
++    }
++    return Futures.immediateVoidFuture()
++  }
++
++  override fun handleStop(): ListenableFuture<*> {
++    remote.stop()
++    return Futures.immediateVoidFuture()
++  }
++
++  override fun handleRelease(): ListenableFuture<*> {
++    scope.cancel()
++    return Futures.immediateVoidFuture()
++  }
++
++  private fun metadata(item: CastMediaItem): MediaMetadata = MediaMetadata.Builder()
++    .setTitle(item.title)
++    .setArtist(item.artist)
++    .setAlbumTitle(item.album)
++    .setArtworkUri(item.artwork)
++    .build()
++
++  private companion object {
++    val COMMANDS: Player.Commands = Player.Commands.Builder().addAll(
++      Player.COMMAND_PLAY_PAUSE,
++      Player.COMMAND_STOP,
++      Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM,
++      Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
++      Player.COMMAND_SEEK_TO_PREVIOUS,
++      Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
++      Player.COMMAND_SEEK_TO_NEXT,
++      Player.COMMAND_SEEK_TO_MEDIA_ITEM,
++      Player.COMMAND_SEEK_TO_DEFAULT_POSITION,
++      Player.COMMAND_GET_CURRENT_MEDIA_ITEM,
++      Player.COMMAND_GET_TIMELINE,
++      Player.COMMAND_GET_METADATA,
++      Player.COMMAND_RELEASE,
++    ).build()
 +  }
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServer.kt b/node_modules/react-native-queue-player/android/src/main/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServer.kt
@@ -4085,6 +4242,178 @@ index 0000000..4379e8d
 +  override fun close() {
 +    runCatching { server.close() }
 +    runCatching { client?.close() }
++  }
++}
+diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/LeasedSessionPlayerTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/LeasedSessionPlayerTest.kt
+new file mode 100644
+index 0000000..c91668f
+--- /dev/null
++++ b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/LeasedSessionPlayerTest.kt
+@@ -0,0 +1,166 @@
++package com.margelo.nitro.queueplayer.cast.direct
++
++import android.net.Uri
++import android.os.Looper
++import androidx.media3.common.Player
++import androidx.media3.common.util.UnstableApi
++import com.margelo.nitro.queueplayer.cast.CastMediaItem
++import com.margelo.nitro.queueplayer.cast.FakeRemotePlayer
++import com.margelo.nitro.queueplayer.cast.RemotePlaybackState
++import kotlinx.coroutines.flow.MutableStateFlow
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++
++/**
++ * The MediaSession view of an MPD / self-hosted Cast session: the system
++ * notification and lock screen must follow the receiver, not the parked
++ * local player, and their play/pause/seek must reach the receiver.
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34])
++@UnstableApi
++class LeasedSessionPlayerTest {
++
++  private val remote = FakeRemotePlayer()
++  private val queue = MutableStateFlow<List<CastMediaItem>>(emptyList())
++  private lateinit var player: LeasedSessionPlayer
++
++  private fun idle() = shadowOf(Looper.getMainLooper()).idle()
++
++  private fun item(n: Int) = CastMediaItem(
++    uri = Uri.parse("https://music.example/$n.flac"),
++    title = "Song $n", artist = "Artist $n", album = "Album $n",
++    artwork = Uri.parse("https://music.example/$n.jpg"), durationMs = n * 60_000L,
++  )
++
++  @Before
++  fun setUp() {
++    player = LeasedSessionPlayer(remote, queue)
++    idle()
++  }
++
++  @After
++  fun tearDown() {
++    player.release()
++  }
++
++  @Test
++  fun `shows the receiver's current track and playing state`() {
++    queue.value = listOf(item(1), item(2), item(3))
++    remote.backingCurrentTrackIndex.value = 1
++    remote.backingPositionMs.value = 42_000
++    remote.reportState(RemotePlaybackState.PLAYING)
++    idle()
++
++    assertEquals(Player.STATE_READY, player.playbackState)
++    assertTrue(player.isPlaying)
++    assertEquals(1, player.currentMediaItemIndex)
++    assertEquals("Song 2", player.mediaMetadata.title.toString())
++    assertEquals("Artist 2", player.mediaMetadata.artist.toString())
++    assertEquals("Album 2", player.mediaMetadata.albumTitle.toString())
++    assertEquals(Uri.parse("https://music.example/2.jpg"), player.mediaMetadata.artworkUri)
++    assertEquals(120_000L, player.duration)
++    assertEquals(42_000L, player.currentPosition)
++  }
++
++  @Test
++  fun `follows the receiver to the next track and to paused`() {
++    queue.value = listOf(item(1), item(2))
++    remote.backingCurrentTrackIndex.value = 0
++    remote.reportState(RemotePlaybackState.PLAYING)
++    idle()
++
++    remote.backingCurrentTrackIndex.value = 1
++    remote.reportState(RemotePlaybackState.PAUSED)
++    idle()
++
++    assertEquals(1, player.currentMediaItemIndex)
++    assertEquals("Song 2", player.mediaMetadata.title.toString())
++    assertEquals(Player.STATE_READY, player.playbackState)
++    assertFalse(player.isPlaying)
++  }
++
++  @Test
++  fun `a loading receiver shows buffering while still trying to play`() {
++    queue.value = listOf(item(1))
++    remote.backingCurrentTrackIndex.value = 0
++    remote.reportState(RemotePlaybackState.LOADING)
++    idle()
++
++    assertEquals(Player.STATE_BUFFERING, player.playbackState)
++    assertTrue(player.playWhenReady)
++  }
++
++  @Test
++  fun `the receiver's measured duration wins over the queued one`() {
++    queue.value = listOf(item(1))
++    remote.backingCurrentTrackIndex.value = 0
++    remote.backingDurationMs.value = 61_500
++    remote.reportState(RemotePlaybackState.PLAYING)
++    idle()
++
++    assertEquals(61_500L, player.duration)
++  }
++
++  @Test
++  fun `an empty queue is idle`() {
++    remote.reportState(RemotePlaybackState.IDLE)
++    idle()
++
++    assertEquals(Player.STATE_IDLE, player.playbackState)
++    assertTrue(player.currentTimeline.isEmpty)
++  }
++
++  @Test
++  fun `play pause and seek go to the receiver`() {
++    queue.value = listOf(item(1), item(2))
++    remote.backingCurrentTrackIndex.value = 0
++    remote.reportState(RemotePlaybackState.PAUSED)
++    idle()
++
++    player.play()
++    idle()
++    player.pause()
++    idle()
++    player.seekTo(30_000)
++    idle()
++
++    assertEquals(listOf("play", "pause", "seekTo:30000"), remote.transportCalls)
++  }
++
++  @Test
++  fun `skipping tracks goes to the receiver's queue`() {
++    queue.value = listOf(item(1), item(2), item(3))
++    remote.backingCurrentTrackIndex.value = 1
++    remote.reportState(RemotePlaybackState.PLAYING)
++    idle()
++
++    player.seekToNextMediaItem()
++    idle()
++    player.seekTo(0, 0)
++    idle()
++
++    assertEquals(listOf("skipToQueueIndex:2", "skipToQueueIndex:0"), remote.transportCalls)
++  }
++
++  @Test
++  fun `stop goes to the receiver`() {
++    queue.value = listOf(item(1))
++    remote.backingCurrentTrackIndex.value = 0
++    remote.reportState(RemotePlaybackState.PLAYING)
++    idle()
++
++    player.stop()
++    idle()
++
++    assertEquals(listOf("stop"), remote.transportCalls)
 +  }
 +}
 diff --git a/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServerTest.kt b/node_modules/react-native-queue-player/android/src/test/java/com/margelo/nitro/queueplayer/cast/direct/MediaLeaseServerTest.kt
